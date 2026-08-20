@@ -1,0 +1,15 @@
+{
+  "name": "s905x-miner-workspace",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "npm --prefix webapp run dev",
+    "build": "npm --prefix webapp run build && cp -r webapp/dist ./dist",
+    "start": "npm --prefix webapp run start",
+    "lint": "npm --prefix webapp run lint"
+  },
+  "workspaces": [
+    "webapp"
+  ]
+}

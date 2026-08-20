@@ -1,0 +1,26 @@
+[Unit]
+Description=S905X Bitcoin Mining Worker Agent Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/s905x-miner
+ExecStart=/usr/bin/python3 /opt/s905x-miner/agent/s905x_agent.py \
+  --server ws://192.168.1.100:3000/ws/worker \
+  --id s905x-node-01 \
+  --miner /opt/s905x-miner/bitcoin_sha256d_s905x \
+  --token s905x_secret_token \
+  --autostart
+Restart=always
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=10
+
+# Resource controls (optional)
+CPUSchedulingPolicy=other
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target

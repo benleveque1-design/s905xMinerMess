@@ -1,0 +1,15 @@
+{
+  "workerId": "s905x-node-01",
+  "name": "Living Room S905X",
+  "controllerWsUrl": "ws://192.168.1.100:3000/ws/worker",
+  "authToken": "s905x_secret_token",
+  "minerBinaryPath": "/opt/s905x-miner/bitcoin_sha256d_s905x",
+  "hashingThreads": 3,
+  "controlCore": 3,
+  "autostart": true,
+  "pool": {
+    "url": "stratum+tcp://solo.ckpool.org:3333",
+    "user": "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh.s905x-01",
+    "pass": "x"
+  }
+}
