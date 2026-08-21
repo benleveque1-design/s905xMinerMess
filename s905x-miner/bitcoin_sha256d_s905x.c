@@ -41,7 +41,20 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <poll.h>
+#include <netdb.h>
+#include <signal.h>
 #include <errno.h>
+
+#ifndef atomic_uint64_t
+typedef _Atomic(uint64_t) atomic_uint64_t;
+#endif
+
+/* Global signal termination flag */
+static volatile sig_atomic_t g_miner_stop = 0;
+static void handle_miner_sig(int sig) {
+    (void)sig;
+    g_miner_stop = 1;
+}
 
 #if defined(__aarch64__)
 #include <arm_neon.h>
@@ -707,7 +720,7 @@ static int run_correctness_tests(void) {
 }
 
 /* ============================================================================
- * SECTION 8b: Mining Control-Plane Simulation (Cores 0-2 hash / Core 3 control)
+ * SECTION 8b: Stratum V1 Mining Engine & Data Structures
  * ============================================================================ */
 
 static inline long timespec_diff_ns(const struct timespec *a, const struct timespec *b) {
@@ -715,70 +728,220 @@ static inline long timespec_diff_ns(const struct timespec *a, const struct times
 }
 
 #define JOB_HEADER_LEN 80
-#define SHARE_QUEUE_CAP 64
+#define SHARE_QUEUE_CAP 128
+#define MAX_MERKLE_BRANCHES 32
 
+/* Convert difficulty to 256-bit big-endian target */
+static void diff_to_target(double diff, uint8_t target_be[32]) {
+    memset(target_be, 0, 32);
+    if (diff <= 0.0) diff = 1.0;
+
+    double current = 4294901760.0 / diff;
+    int start_word = 1;
+
+    while (current >= 4294967296.0 && start_word > 0) {
+        current /= 4294967296.0;
+        start_word--;
+    }
+    while (current < 1.0 && start_word < 7) {
+        current *= 4294967296.0;
+        start_word++;
+    }
+
+    for (int w = start_word; w < 8; w++) {
+        uint32_t val = (uint32_t)current;
+        target_be[w * 4 + 0] = (uint8_t)((val >> 24) & 0xFF);
+        target_be[w * 4 + 1] = (uint8_t)((val >> 16) & 0xFF);
+        target_be[w * 4 + 2] = (uint8_t)((val >> 8)  & 0xFF);
+        target_be[w * 4 + 3] = (uint8_t)( val        & 0xFF);
+        current = (current - (double)val) * 4294967296.0;
+        if (current <= 0.0) break;
+    }
+}
+
+/* Construct Coinbase and compute sha256d hash */
+static int stratum_build_coinbase(const char *coinb1_hex, const char *extranonce1_hex,
+                                  const char *extranonce2_hex, const char *coinb2_hex,
+                                  uint8_t *coinbase_hash) {
+    size_t len1 = strlen(coinb1_hex);
+    size_t len_en1 = strlen(extranonce1_hex);
+    size_t len_en2 = strlen(extranonce2_hex);
+    size_t len2 = strlen(coinb2_hex);
+    size_t total_hex_len = len1 + len_en1 + len_en2 + len2;
+
+    if (total_hex_len % 2 != 0 || total_hex_len > 16384) return -1;
+
+    char *coinbase_hex = (char *)malloc(total_hex_len + 1);
+    if (!coinbase_hex) return -1;
+
+    memcpy(coinbase_hex, coinb1_hex, len1);
+    memcpy(coinbase_hex + len1, extranonce1_hex, len_en1);
+    memcpy(coinbase_hex + len1 + len_en1, extranonce2_hex, len_en2);
+    memcpy(coinbase_hex + len1 + len_en1 + len_en2, coinb2_hex, len2);
+    coinbase_hex[total_hex_len] = '\0';
+
+    size_t bin_len = total_hex_len / 2;
+    uint8_t *coinbase_bin = (uint8_t *)malloc(bin_len);
+    if (!coinbase_bin) {
+        free(coinbase_hex);
+        return -1;
+    }
+
+    hex_to_bytes(coinbase_hex, coinbase_bin, bin_len);
+    free(coinbase_hex);
+
+    sha256d(coinbase_bin, bin_len, coinbase_hash);
+    free(coinbase_bin);
+    return 0;
+}
+
+/* Compute Merkle Root by iteratively combining coinbase hash with merkle branches */
+static int stratum_build_merkle_root(const uint8_t *coinbase_hash, int branch_count,
+                                     char branches[][65], uint8_t *merkle_root) {
+    memcpy(merkle_root, coinbase_hash, 32);
+
+    for (int i = 0; i < branch_count; i++) {
+        uint8_t branch_bin[32];
+        hex_to_bytes(branches[i], branch_bin, 32);
+
+        uint8_t combined[64];
+        memcpy(combined, merkle_root, 32);
+        memcpy(combined + 32, branch_bin, 32);
+
+        sha256d(combined, 64, merkle_root);
+    }
+    return 0;
+}
+
+/* Build standard 80-byte Bitcoin block header with exact Stratum V1 endianness */
+static void stratum_build_header(uint8_t header[80], uint32_t version,
+                                 const char *prevhash_hex, const uint8_t *merkle_root,
+                                 uint32_t ntime, uint32_t nbits, uint32_t nonce) {
+    write_uint32_le(header + 0, version);
+
+    /* Stratum V1 prevhash requires swab32 on each 4-byte chunk */
+    uint8_t raw_prev[32];
+    hex_to_bytes(prevhash_hex, raw_prev, 32);
+    for (int i = 0; i < 8; i++) {
+        header[4 + i * 4 + 0] = raw_prev[i * 4 + 3];
+        header[4 + i * 4 + 1] = raw_prev[i * 4 + 2];
+        header[4 + i * 4 + 2] = raw_prev[i * 4 + 1];
+        header[4 + i * 4 + 3] = raw_prev[i * 4 + 0];
+    }
+
+    memcpy(header + 36, merkle_root, 32);
+    write_uint32_le(header + 68, ntime);
+    write_uint32_le(header + 72, nbits);
+    write_uint32_le(header + 76, nonce);
+}
+
+/* Shared work structure for lock-free worker polling */
 typedef struct {
     pthread_mutex_t lock;
     atomic_uint version;
+    bitcoin_midstate_t midstate;
     uint8_t header[JOB_HEADER_LEN];
-} shared_job_t;
+    uint8_t target_be[32];
+    char job_id[64];
+    char ntime_hex[9];
+    char extranonce2_hex[32];
+    atomic_int clean_job_flag;
+} shared_stratum_work_t;
 
-static void shared_job_init(shared_job_t *job, const uint8_t *initial_header) {
-    pthread_mutex_init(&job->lock, NULL);
-    atomic_init(&job->version, 1);
-    memcpy(job->header, initial_header, JOB_HEADER_LEN);
+static void shared_stratum_work_init(shared_stratum_work_t *w) {
+    pthread_mutex_init(&w->lock, NULL);
+    atomic_init(&w->version, 0);
+    atomic_init(&w->clean_job_flag, 0);
+    memset(w->header, 0, JOB_HEADER_LEN);
+    diff_to_target(1.0, w->target_be);
+    w->job_id[0] = '\0';
+    strcpy(w->ntime_hex, "00000000");
+    strcpy(w->extranonce2_hex, "00000000");
 }
 
-static void shared_job_destroy(shared_job_t *job) {
-    pthread_mutex_destroy(&job->lock);
+static void shared_stratum_work_destroy(shared_stratum_work_t *w) {
+    pthread_mutex_destroy(&w->lock);
 }
 
-/* Called only by the control thread (core 3), roughly a few times a second. */
-static void shared_job_publish(shared_job_t *job, const uint8_t *new_header) {
-    pthread_mutex_lock(&job->lock);
-    memcpy(job->header, new_header, JOB_HEADER_LEN);
-    pthread_mutex_unlock(&job->lock);
-    atomic_fetch_add(&job->version, 1);
+static void shared_stratum_work_publish(shared_stratum_work_t *w,
+                                        const uint8_t *header,
+                                        const uint8_t *target_be,
+                                        const char *job_id,
+                                        const char *ntime_hex,
+                                        const char *extranonce2_hex,
+                                        int clean_job) {
+    pthread_mutex_lock(&w->lock);
+    memcpy(w->header, header, JOB_HEADER_LEN);
+    memcpy(w->target_be, target_be, 32);
+    bitcoin_midstate_init(&w->midstate, header);
+    strncpy(w->job_id, job_id, sizeof(w->job_id) - 1);
+    w->job_id[sizeof(w->job_id) - 1] = '\0';
+    strncpy(w->ntime_hex, ntime_hex, sizeof(w->ntime_hex) - 1);
+    w->ntime_hex[sizeof(w->ntime_hex) - 1] = '\0';
+    strncpy(w->extranonce2_hex, extranonce2_hex, sizeof(w->extranonce2_hex) - 1);
+    w->extranonce2_hex[sizeof(w->extranonce2_hex) - 1] = '\0';
+    if (clean_job) {
+        atomic_store(&w->clean_job_flag, 1);
+    }
+    pthread_mutex_unlock(&w->lock);
+    atomic_fetch_add(&w->version, 1);
 }
 
-/* Called by hash workers only when their cached version is stale. */
-static unsigned shared_job_load(shared_job_t *job, uint8_t *out_header) {
-    unsigned v = atomic_load(&job->version);
-    pthread_mutex_lock(&job->lock);
-    memcpy(out_header, job->header, JOB_HEADER_LEN);
-    pthread_mutex_unlock(&job->lock);
+static unsigned shared_stratum_work_load(shared_stratum_work_t *w,
+                                         bitcoin_midstate_t *out_midstate,
+                                         uint8_t *out_target_be,
+                                         char *out_job_id,
+                                         char *out_ntime_hex,
+                                         char *out_extranonce2_hex) {
+    unsigned v = atomic_load(&w->version);
+    pthread_mutex_lock(&w->lock);
+    memcpy(out_midstate, &w->midstate, sizeof(bitcoin_midstate_t));
+    memcpy(out_target_be, w->target_be, 32);
+    strcpy(out_job_id, w->job_id);
+    strcpy(out_ntime_hex, w->ntime_hex);
+    strcpy(out_extranonce2_hex, w->extranonce2_hex);
+    pthread_mutex_unlock(&w->lock);
     return v;
 }
 
+/* Share Queue */
 typedef struct {
     uint32_t nonce;
+    char job_id[64];
+    char ntime_hex[9];
+    char extranonce2_hex[32];
     unsigned job_version;
-} share_t;
+} stratum_share_t;
 
 typedef struct {
     pthread_mutex_t lock;
-    share_t items[SHARE_QUEUE_CAP];
+    stratum_share_t items[SHARE_QUEUE_CAP];
     int head, tail, count;
     atomic_ulong found_total;
     atomic_ulong dropped_total;
-} share_queue_t;
+} stratum_share_queue_t;
 
-static void share_queue_init(share_queue_t *q) {
+static void stratum_share_queue_init(stratum_share_queue_t *q) {
     pthread_mutex_init(&q->lock, NULL);
     q->head = q->tail = q->count = 0;
     atomic_init(&q->found_total, 0);
     atomic_init(&q->dropped_total, 0);
 }
 
-static void share_queue_destroy(share_queue_t *q) {
+static void stratum_share_queue_destroy(stratum_share_queue_t *q) {
     pthread_mutex_destroy(&q->lock);
 }
 
-static void share_queue_push(share_queue_t *q, uint32_t nonce, unsigned jv) {
+static void stratum_share_queue_push(stratum_share_queue_t *q, uint32_t nonce,
+                                     const char *job_id, const char *ntime_hex,
+                                     const char *extranonce2_hex, unsigned jv) {
     atomic_fetch_add(&q->found_total, 1);
     pthread_mutex_lock(&q->lock);
     if (q->count < SHARE_QUEUE_CAP) {
         q->items[q->tail].nonce = nonce;
+        snprintf(q->items[q->tail].job_id, sizeof(q->items[q->tail].job_id), "%s", job_id);
+        snprintf(q->items[q->tail].ntime_hex, sizeof(q->items[q->tail].ntime_hex), "%s", ntime_hex);
+        snprintf(q->items[q->tail].extranonce2_hex, sizeof(q->items[q->tail].extranonce2_hex), "%s", extranonce2_hex);
         q->items[q->tail].job_version = jv;
         q->tail = (q->tail + 1) % SHARE_QUEUE_CAP;
         q->count++;
@@ -789,7 +952,7 @@ static void share_queue_push(share_queue_t *q, uint32_t nonce, unsigned jv) {
     }
 }
 
-static int share_queue_pop(share_queue_t *q, share_t *out) {
+static int stratum_share_queue_pop(stratum_share_queue_t *q, stratum_share_t *out) {
     int got = 0;
     pthread_mutex_lock(&q->lock);
     if (q->count > 0) {
@@ -802,111 +965,90 @@ static int share_queue_pop(share_queue_t *q, share_t *out) {
     return got;
 }
 
-/* ---- Stub pool: stands in for a remote Stratum server over loopback TCP ---- */
+/* URL Parser: extracts host, port from stratum+tcp://host:port or host:port */
+static int parse_stratum_url(const char *url, char *host, int max_host_len, int *port) {
+    *port = 3333; /* default Stratum port */
+    const char *p = url;
 
-typedef struct {
-    atomic_int *stop_flag;
-    atomic_int ready;
-    int port;
-} stub_pool_arg_t;
+    if (strncmp(p, "stratum+tcp://", 14) == 0) p += 14;
+    else if (strncmp(p, "stratum://", 10) == 0) p += 10;
+    else if (strncmp(p, "tcp://", 6) == 0) p += 6;
 
-static void *stub_pool_thread(void *arg) {
-    stub_pool_arg_t *a = (stub_pool_arg_t *)arg;
-
-    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (listen_fd < 0) return NULL;
-    int opt = 1;
-    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port = 0;
-
-    if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        close(listen_fd);
-        return NULL;
+    const char *colon = strchr(p, ':');
+    if (colon) {
+        size_t hlen = (size_t)(colon - p);
+        if (hlen >= (size_t)max_host_len) hlen = (size_t)max_host_len - 1;
+        memcpy(host, p, hlen);
+        host[hlen] = '\0';
+        *port = atoi(colon + 1);
+        if (*port <= 0 || *port > 65535) *port = 3333;
+    } else {
+        snprintf(host, (size_t)max_host_len, "%s", p);
     }
-    socklen_t alen = sizeof(addr);
-    getsockname(listen_fd, (struct sockaddr *)&addr, &alen);
-    a->port = ntohs(addr.sin_port);
-    listen(listen_fd, 1);
-    atomic_store(&a->ready, 1);
-
-    while (!atomic_load(a->stop_flag)) {
-        int conn_fd = -1;
-        while (!atomic_load(a->stop_flag) && conn_fd < 0) {
-            struct pollfd pfd = { listen_fd, POLLIN, 0 };
-            int pr = poll(&pfd, 1, 100);
-            if (pr > 0 && (pfd.revents & POLLIN)) {
-                conn_fd = accept(listen_fd, NULL, NULL);
-            }
-        }
-        if (conn_fd < 0) break;
-
-        unsigned job_counter = 0;
-        char buf[256];
-        while (!atomic_load(a->stop_flag)) {
-            struct pollfd pfd = { conn_fd, POLLIN, 0 };
-            int pr = poll(&pfd, 1, 100);
-            if (pr <= 0) continue;
-            ssize_t n = recv(conn_fd, buf, sizeof(buf) - 1, 0);
-            if (n <= 0) break;
-            buf[n] = '\0';
-            if (strncmp(buf, "GETJOB", 6) == 0) {
-                job_counter++;
-                char resp[64];
-                int len = snprintf(resp, sizeof(resp), "JOB %u\n", job_counter);
-                send(conn_fd, resp, (size_t)len, 0);
-            } else if (strncmp(buf, "SUBMIT", 6) == 0) {
-                const char *ok = "OK\n";
-                send(conn_fd, ok, 3, 0);
-            }
-        }
-        close(conn_fd);
-    }
-
-    close(listen_fd);
-    return NULL;
+    return 0;
 }
 
-/* ---- Control thread: the actual "mining client" Stratum/job/share thread ---- */
+/* Connect TCP socket to Stratum pool host & port */
+static int stratum_connect(const char *host, int port) {
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%d", port);
 
-typedef struct {
-    int cpu_id;
-    atomic_int *stop_flag;
-    shared_job_t *job;
-    share_queue_t *shares;
-    int stub_port;
-    int job_interval_ms;
-    int reconnect_interval_ms;
-    atomic_ulong job_updates;
-    atomic_ulong shares_submitted;
-    atomic_ulong reconnects;
-} control_thread_arg_t;
+    struct addrinfo hints, *res = NULL, *rp = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
 
-static int control_connect(int port) {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port = htons((uint16_t)port);
-    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        close(fd);
+    if (getaddrinfo(host, port_str, &hints, &res) != 0) {
         return -1;
     }
-    struct timeval tv;
-    tv.tv_sec = 0;
-    tv.tv_usec = 150000;
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    int fd = -1;
+    for (rp = res; rp != NULL; rp = rp->ai_next) {
+        fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (fd < 0) continue;
+
+        int opt = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+        setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &opt, sizeof(opt));
+
+        struct timeval tv;
+        tv.tv_sec = 5;
+        tv.tv_usec = 0;
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+        if (connect(fd, rp->ai_addr, rp->ai_addrlen) == 0) {
+            break;
+        }
+        close(fd);
+        fd = -1;
+    }
+
+    freeaddrinfo(res);
     return fd;
 }
 
-static void *control_worker(void *arg) {
-    control_thread_arg_t *targ = (control_thread_arg_t *)arg;
+/* JSON string helper */
+static const char *json_skip_whitespace(const char *p) {
+    while (*p && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) p++;
+    return p;
+}
+
+/* Stratum Worker Thread Argument */
+typedef struct {
+    int cpu_id;
+    int thread_idx;
+    int total_threads;
+    atomic_int *stop_flag;
+    shared_stratum_work_t *shared_work;
+    stratum_share_queue_t *share_queue;
+    atomic_uint64_t *total_hashes;
+} stratum_worker_arg_t;
+
+#define HASH_CHECK_INTERVAL 8192u
+
+static void *stratum_hash_worker(void *arg) {
+    stratum_worker_arg_t *targ = (stratum_worker_arg_t *)arg;
 
     if (targ->cpu_id >= 0) {
         cpu_set_t cpuset;
@@ -915,90 +1057,536 @@ static void *control_worker(void *arg) {
         pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
     }
 
-    const char *b125552_hex = "0100000081cd02ab7e569e8bcd9317e2fe99f2de44d49ab2b8851ba4a308000000000000e320b6c2fffc8d750423db8b1eb942ae710e951ed797f7affc8892b0f1fc122bc7f5d74df2b9441a42a14695";
-    uint8_t base_header[80];
-    hex_to_bytes(b125552_hex, base_header, 80);
+    bitcoin_midstate_t local_ms;
+    uint8_t local_target[32];
+    char local_job_id[64] = {0};
+    char local_ntime[9] = {0};
+    char local_en2[32] = {0};
+    unsigned local_version = 0;
 
-    int fd = -1;
-    while (!atomic_load(targ->stop_flag) && fd < 0) {
-        fd = control_connect(targ->stub_port);
-        if (fd < 0) usleep(50000);
+    uint32_t nonce = (uint32_t)targ->thread_idx;
+    uint32_t stride = (uint32_t)targ->total_threads;
+    uint8_t raw_hash[32];
+    uint8_t display_hash[32];
+
+    while (!atomic_load(targ->stop_flag) && !g_miner_stop) {
+        /* Wait for first job */
+        if (local_version == 0 || atomic_load(&targ->shared_work->version) != local_version) {
+            local_version = shared_stratum_work_load(targ->shared_work, &local_ms, local_target,
+                                                    local_job_id, local_ntime, local_en2);
+            if (local_version == 0 || local_job_id[0] == '\0') {
+                usleep(5000);
+                continue;
+            }
+            nonce = (uint32_t)targ->thread_idx;
+        }
+
+        /* Tight inner hashing loop */
+        for (uint32_t iter = 0; iter < HASH_CHECK_INTERVAL; iter++) {
+            bitcoin_hash_nonce_opt(&local_ms, nonce, raw_hash);
+
+            /* Reverse raw hash to display hash (big-endian 256-bit value) */
+            reverse_bytes(display_hash, raw_hash, 32);
+
+            /* Compare with pool share target */
+            if (memcmp(display_hash, local_target, 32) <= 0) {
+                stratum_share_queue_push(targ->share_queue, nonce, local_job_id,
+                                        local_ntime, local_en2, local_version);
+            }
+
+            nonce += stride;
+        }
+
+        atomic_fetch_add_explicit(targ->total_hashes, HASH_CHECK_INTERVAL, memory_order_relaxed);
+
+        /* Check for clean job or updated work */
+        if (atomic_load(&targ->shared_work->version) != local_version) {
+            local_version = shared_stratum_work_load(targ->shared_work, &local_ms, local_target,
+                                                    local_job_id, local_ntime, local_en2);
+            nonce = (uint32_t)targ->thread_idx;
+        }
     }
 
-    struct timespec last_job, last_reconnect, now;
-    clock_gettime(CLOCK_MONOTONIC, &last_job);
-    clock_gettime(CLOCK_MONOTONIC, &last_reconnect);
-
-    while (!atomic_load(targ->stop_flag)) {
-        clock_gettime(CLOCK_MONOTONIC, &now);
-
-        /* Poll for a new job */
-        if (fd >= 0 && timespec_diff_ns(&now, &last_job) / 1000000 >= targ->job_interval_ms) {
-            const char *req = "GETJOB\n";
-            if (send(fd, req, strlen(req), 0) >= 0) {
-                char buf[64];
-                ssize_t n = recv(fd, buf, sizeof(buf) - 1, 0);
-                if (n > 0) {
-                    buf[n] = '\0';
-                    unsigned jc = 0;
-                    sscanf(buf, "JOB %u", &jc);
-                    uint8_t new_header[80];
-                    memcpy(new_header, base_header, 80);
-                    write_uint32_le(new_header + 68, (uint32_t)(1231006505u + jc));
-                    shared_job_publish(targ->job, new_header);
-                    atomic_fetch_add(&targ->job_updates, 1);
-                }
-            }
-            last_job = now;
-        }
-
-        /* Drain and submit shares */
-        share_t s;
-        while (fd >= 0 && share_queue_pop(targ->shares, &s)) {
-            char msg[64];
-            int len = snprintf(msg, sizeof(msg), "SUBMIT %u\n", s.nonce);
-            if (send(fd, msg, (size_t)len, 0) >= 0) {
-                char ack[16];
-                recv(fd, ack, sizeof(ack), 0);
-                atomic_fetch_add(&targ->shares_submitted, 1);
-            }
-        }
-
-        /* Periodically simulate a pool reconnect */
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        if (targ->reconnect_interval_ms > 0 &&
-            timespec_diff_ns(&now, &last_reconnect) / 1000000 >= targ->reconnect_interval_ms) {
-            if (fd >= 0) close(fd);
-            usleep(20000);
-            fd = control_connect(targ->stub_port);
-            atomic_fetch_add(&targ->reconnects, 1);
-            last_reconnect = now;
-        }
-
-        usleep(20000);
-    }
-
-    if (fd >= 0) close(fd);
     return NULL;
 }
 
-/*
- * Benchmark Worker:
- * Optimized using Midstate Precomputation. The initial 64-byte block (invariant)
- * is hashed ONCE per work template, and each subsequent nonce only hashes the
- * second block + the second SHA-256 pass (2 compressions per hash instead of 3).
- */
+/* Stratum Control Thread Argument */
+typedef struct {
+    int cpu_id;
+    char pool_url[256];
+    char user[256];
+    char pass[256];
+    atomic_int *stop_flag;
+    shared_stratum_work_t *shared_work;
+    stratum_share_queue_t *share_queue;
+    atomic_uint64_t *total_hashes;
+    atomic_ulong shares_accepted;
+    atomic_ulong shares_rejected;
+    atomic_ulong shares_stale;
+    atomic_ulong reconnect_count;
+    uint32_t first_submit_id;
+    uint32_t auth_msg_id;
+} stratum_control_arg_t;
+
+/* Process a complete line from Stratum server */
+static void process_stratum_line(const char *line, stratum_control_arg_t *carg,
+                                char *extranonce1, int *extranonce2_size,
+                                uint64_t *extranonce2_val, double *current_diff,
+                                uint8_t *current_target) {
+    /* Parse response ID if present */
+    uint32_t resp_id = 0;
+    const char *id_ptr = strstr(line, "\"id\":");
+    if (!id_ptr) id_ptr = strstr(line, "\"id\" :");
+    if (id_ptr) {
+        const char *colon = strchr(id_ptr, ':');
+        if (colon) {
+            resp_id = (uint32_t)strtoul(colon + 1, NULL, 10);
+        }
+    }
+
+    /* Check if response is for mining.authorize (do not count as share!) */
+    if (resp_id > 0 && resp_id == carg->auth_msg_id) {
+        if (strstr(line, "\"result\":true") || strstr(line, "\"result\": true")) {
+            printf("Stratum: Authorized successfully as %s\n", carg->user);
+            fflush(stdout);
+        } else {
+            printf("Stratum: Authorization failed for %s\n", carg->user);
+            fflush(stdout);
+        }
+        return;
+    }
+
+    /* 1. Check for mining.set_difficulty */
+    if (strstr(line, "\"mining.set_difficulty\"") || strstr(line, "mining.set_difficulty")) {
+        const char *p = strstr(line, "\"params\":");
+        if (!p) p = strstr(line, "\"params\" :");
+        if (p) {
+            const char *arr = strchr(p, '[');
+            if (arr) {
+                double diff = atof(arr + 1);
+                if (diff > 0.0) {
+                    *current_diff = diff;
+                    diff_to_target(diff, current_target);
+                }
+            }
+        }
+        return;
+    }
+
+    /* 2. Check for mining.notify */
+    if (strstr(line, "\"mining.notify\"") || strstr(line, "mining.notify")) {
+        const char *p = strstr(line, "\"params\":");
+        if (!p) p = strstr(line, "\"params\" :");
+        if (!p) return;
+
+        const char *arr = strchr(p, '[');
+        if (!arr) return;
+
+        /* Parse params array: [job_id, prevhash, coinb1, coinb2, merkle_branch, version, nbits, ntime, clean_jobs] */
+        char job_id[64] = {0};
+        char prevhash[65] = {0};
+        char coinb1[4096] = {0};
+        char coinb2[4096] = {0};
+        char version[16] = {0};
+        char nbits[16] = {0};
+        char ntime[16] = {0};
+        int clean_jobs = 0;
+        char branches[MAX_MERKLE_BRANCHES][65];
+        int branch_count = 0;
+
+        const char *cur = arr + 1;
+        int param_idx = 0;
+
+        while (*cur && *cur != ']' && param_idx < 9) {
+            cur = json_skip_whitespace(cur);
+            if (*cur == ',') { cur++; continue; }
+
+            if (param_idx == 4 && *cur == '[') {
+                /* Merkle branch array */
+                cur++;
+                while (*cur && *cur != ']' && branch_count < MAX_MERKLE_BRANCHES) {
+                    cur = json_skip_whitespace(cur);
+                    if (*cur == ',') { cur++; continue; }
+                    if (*cur == '\"') {
+                        cur++;
+                        const char *q = strchr(cur, '\"');
+                        if (q) {
+                            size_t blen = (size_t)(q - cur);
+                            if (blen == 64) {
+                                memcpy(branches[branch_count], cur, 64);
+                                branches[branch_count][64] = '\0';
+                                branch_count++;
+                            }
+                            cur = q + 1;
+                        } else break;
+                    } else cur++;
+                }
+                if (*cur == ']') cur++;
+                param_idx++;
+                continue;
+            }
+
+            if (*cur == '\"') {
+                cur++;
+                const char *q = strchr(cur, '\"');
+                if (q) {
+                    size_t slen = (size_t)(q - cur);
+                    if (param_idx == 0) { size_t l = slen < 63 ? slen : 63; memcpy(job_id, cur, l); job_id[l] = '\0'; }
+                    else if (param_idx == 1) { size_t l = slen < 64 ? slen : 64; memcpy(prevhash, cur, l); prevhash[l] = '\0'; }
+                    else if (param_idx == 2) { size_t l = slen < 4095 ? slen : 4095; memcpy(coinb1, cur, l); coinb1[l] = '\0'; }
+                    else if (param_idx == 3) { size_t l = slen < 4095 ? slen : 4095; memcpy(coinb2, cur, l); coinb2[l] = '\0'; }
+                    else if (param_idx == 5) { size_t l = slen < 15 ? slen : 15; memcpy(version, cur, l); version[l] = '\0'; }
+                    else if (param_idx == 6) { size_t l = slen < 15 ? slen : 15; memcpy(nbits, cur, l); nbits[l] = '\0'; }
+                    else if (param_idx == 7) { size_t l = slen < 15 ? slen : 15; memcpy(ntime, cur, l); ntime[l] = '\0'; }
+                    cur = q + 1;
+                } else break;
+            } else if (param_idx == 8) {
+                if (strncmp(cur, "true", 4) == 0) clean_jobs = 1;
+                else clean_jobs = 0;
+                while (*cur && *cur != ']' && *cur != ',') cur++;
+            } else {
+                while (*cur && *cur != ']' && *cur != ',') cur++;
+            }
+            param_idx++;
+        }
+
+        if (job_id[0] && prevhash[0] && coinb1[0] && coinb2[0]) {
+            /* Format extranonce2 */
+            char en2_hex[32] = {0};
+            int en2_hex_len = (*extranonce2_size > 0) ? (*extranonce2_size * 2) : 8;
+            if (en2_hex_len > 16) en2_hex_len = 16;
+            snprintf(en2_hex, sizeof(en2_hex), "%0*llx", en2_hex_len, (unsigned long long)(*extranonce2_val)++);
+
+            /* Build coinbase hash */
+            uint8_t cb_hash[32];
+            if (stratum_build_coinbase(coinb1, extranonce1, en2_hex, coinb2, cb_hash) == 0) {
+                /* Build merkle root */
+                uint8_t mr[32];
+                stratum_build_merkle_root(cb_hash, branch_count, branches, mr);
+
+                /* Build header */
+                uint32_t ver_val = (uint32_t)strtoul(version, NULL, 16);
+                uint32_t nbits_val = (uint32_t)strtoul(nbits, NULL, 16);
+                uint32_t ntime_val = (uint32_t)strtoul(ntime, NULL, 16);
+
+                uint8_t full_hdr[80];
+                stratum_build_header(full_hdr, ver_val, prevhash, mr, ntime_val, nbits_val, 0);
+
+                /* Publish new work to all workers */
+                shared_stratum_work_publish(carg->shared_work, full_hdr, current_target,
+                                            job_id, ntime, en2_hex, clean_jobs);
+            }
+        }
+        return;
+    }
+
+    /* 3. Check for share submission response (only for IDs >= first_submit_id) */
+    if (resp_id > 0 && carg->first_submit_id > 0 && resp_id >= carg->first_submit_id) {
+        if (strstr(line, "\"result\":true") || strstr(line, "\"result\": true")) {
+            atomic_fetch_add(&carg->shares_accepted, 1);
+            printf("[Share] Accepted by pool! (Total Accepted: %lu)\n", atomic_load(&carg->shares_accepted));
+            fflush(stdout);
+        } else if (strstr(line, "\"error\":") || strstr(line, "\"error\" :")) {
+            if (!strstr(line, "\"error\":null") && !strstr(line, "\"error\": null")) {
+                atomic_fetch_add(&carg->shares_rejected, 1);
+                if (strstr(line, "stale") || strstr(line, "Stale") || strstr(line, "job not found")) {
+                    atomic_fetch_add(&carg->shares_stale, 1);
+                }
+                printf("[Share] Rejected by pool! (Total Rejected: %lu)\n", atomic_load(&carg->shares_rejected));
+                fflush(stdout);
+            }
+        }
+    }
+}
+
+static void *stratum_control_worker(void *arg) {
+    stratum_control_arg_t *carg = (stratum_control_arg_t *)arg;
+
+    if (carg->cpu_id >= 0) {
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        CPU_SET(carg->cpu_id, &cpuset);
+        pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+    }
+
+    char host[256];
+    int port = 3333;
+    parse_stratum_url(carg->pool_url, host, sizeof(host), &port);
+
+    char extranonce1[64] = "00000000";
+    int extranonce2_size = 4;
+    uint64_t extranonce2_val = 1;
+    double current_diff = 1.0;
+    uint8_t current_target[32];
+    diff_to_target(current_diff, current_target);
+
+    uint32_t msg_id = 1;
+    int sock_fd = -1;
+
+    char recv_buf[16384];
+    int recv_len = 0;
+
+    struct timespec last_telemetry, now;
+    clock_gettime(CLOCK_MONOTONIC, &last_telemetry);
+    uint64_t last_hash_count = 0;
+
+    while (!atomic_load(carg->stop_flag) && !g_miner_stop) {
+        /* Connect if disconnected */
+        if (sock_fd < 0) {
+            printf("Pool: %s\n", carg->pool_url);
+            printf("Status: CONNECTING (%s:%d)...\n", host, port);
+            sock_fd = stratum_connect(host, port);
+            if (sock_fd < 0) {
+                printf("Status: CONNECTION_FAILED (retrying in 3s)\n\n");
+                atomic_fetch_add(&carg->reconnect_count, 1);
+                for (int i = 0; i < 30 && !atomic_load(carg->stop_flag) && !g_miner_stop; i++) {
+                    usleep(100000);
+                }
+                continue;
+            }
+
+            printf("Status: CONNECTED\n");
+            recv_len = 0;
+
+            /* Send mining.subscribe */
+            uint32_t sub_req_id = msg_id++;
+            char sub_req[256];
+            snprintf(sub_req, sizeof(sub_req),
+                     "{\"id\": %u, \"method\": \"mining.subscribe\", \"params\": [\"bitcoin_sha256d_s905x/1.0\", null]}\n",
+                     sub_req_id);
+            send(sock_fd, sub_req, strlen(sub_req), 0);
+
+            /* Wait for subscribe response */
+            char resp_line[4096];
+            int got_sub = 0;
+            while (!atomic_load(carg->stop_flag) && !g_miner_stop && !got_sub) {
+                ssize_t n = recv(sock_fd, recv_buf + recv_len, sizeof(recv_buf) - 1 - (size_t)recv_len, 0);
+                if (n <= 0) break;
+                recv_len += (int)n;
+                recv_buf[recv_len] = '\0';
+
+                char *nl = strchr(recv_buf, '\n');
+                if (nl) {
+                    *nl = '\0';
+                    strncpy(resp_line, recv_buf, sizeof(resp_line) - 1);
+                    resp_line[sizeof(resp_line) - 1] = '\0';
+
+                    int remaining = recv_len - (int)(nl - recv_buf + 1);
+                    if (remaining > 0) {
+                        memmove(recv_buf, nl + 1, (size_t)remaining);
+                    }
+                    recv_len = remaining;
+
+                    /* Parse extranonce1 and extranonce2_size from subscribe response */
+                    const char *res_pos = strstr(resp_line, "\"result\":");
+                    if (!res_pos) res_pos = strstr(resp_line, "\"result\" :");
+                    if (res_pos) {
+                        const char *arr = strchr(res_pos, '[');
+                        if (arr) {
+                            /* Find extranonce1 (hex string after first array) */
+                            const char *first_close = strchr(arr, ']');
+                            if (first_close) {
+                                const char *q1 = strchr(first_close, '\"');
+                                if (q1) {
+                                    q1++;
+                                    const char *q2 = strchr(q1, '\"');
+                                    if (q2) {
+                                        size_t en1_len = (size_t)(q2 - q1);
+                                        if (en1_len < sizeof(extranonce1)) {
+                                            memcpy(extranonce1, q1, en1_len);
+                                            extranonce1[en1_len] = '\0';
+                                        }
+                                        const char *comma = strchr(q2, ',');
+                                        if (comma) {
+                                            extranonce2_size = atoi(comma + 1);
+                                            if (extranonce2_size <= 0) extranonce2_size = 4;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    got_sub = 1;
+                }
+            }
+
+            if (!got_sub) {
+                close(sock_fd);
+                sock_fd = -1;
+                continue;
+            }
+
+            /* Send mining.authorize */
+            uint32_t auth_id = msg_id++;
+            carg->auth_msg_id = auth_id;
+            carg->first_submit_id = msg_id; /* All future IDs are share submits */
+
+            char auth_req[1024];
+            snprintf(auth_req, sizeof(auth_req),
+                     "{\"id\": %u, \"method\": \"mining.authorize\", \"params\": [\"%s\", \"%s\"]}\n",
+                     auth_id, carg->user, carg->pass);
+            send(sock_fd, auth_req, strlen(auth_req), 0);
+        }
+
+        /* Main Network & Share Submission Loop */
+        struct pollfd pfd = { sock_fd, POLLIN, 0 };
+        int pr = poll(&pfd, 1, 50);
+
+        if (pr > 0 && (pfd.revents & (POLLIN | POLLERR | POLLHUP))) {
+            ssize_t n = recv(sock_fd, recv_buf + recv_len, sizeof(recv_buf) - 1 - (size_t)recv_len, 0);
+            if (n <= 0) {
+                /* Connection lost */
+                close(sock_fd);
+                sock_fd = -1;
+                atomic_fetch_add(&carg->reconnect_count, 1);
+                continue;
+            }
+            recv_len += (int)n;
+            recv_buf[recv_len] = '\0';
+
+            /* Extract and process all complete lines */
+            char *start = recv_buf;
+            char *nl = NULL;
+            while ((nl = strchr(start, '\n')) != NULL) {
+                *nl = '\0';
+                process_stratum_line(start, carg, extranonce1, &extranonce2_size,
+                                     &extranonce2_val, &current_diff, current_target);
+                start = nl + 1;
+            }
+            int remaining = recv_len - (int)(start - recv_buf);
+            if (remaining > 0 && start != recv_buf) {
+                memmove(recv_buf, start, (size_t)remaining);
+            }
+            recv_len = remaining;
+        }
+
+        /* Drain and submit found shares from worker threads */
+        stratum_share_t share;
+        while (sock_fd >= 0 && stratum_share_queue_pop(carg->share_queue, &share)) {
+            uint32_t share_msg_id = msg_id++;
+            char sub_msg[512];
+            snprintf(sub_msg, sizeof(sub_msg),
+                     "{\"id\": %u, \"method\": \"mining.submit\", \"params\": [\"%s\", \"%s\", \"%s\", \"%s\", \"%08x\"]}\n",
+                     share_msg_id, carg->user, share.job_id, share.extranonce2_hex, share.ntime_hex, share.nonce);
+            send(sock_fd, sub_msg, strlen(sub_msg), 0);
+            printf("[Share] Submitting nonce 0x%08x for job %s (sub_id: %u)\n", share.nonce, share.job_id, share_msg_id);
+            fflush(stdout);
+        }
+
+        /* Telemetry reporting every ~2.5 seconds */
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long elapsed_ms = timespec_diff_ns(&now, &last_telemetry) / 1000000L;
+        if (elapsed_ms >= 2500) {
+            uint64_t current_hashes = atomic_load(carg->total_hashes);
+            uint64_t hash_delta = (current_hashes >= last_hash_count) ? (current_hashes - last_hash_count) : 0;
+            double mhs = ((double)hash_delta / ((double)elapsed_ms / 1000.0)) / 1000000.0;
+
+            printf("Pool: %s\n", carg->pool_url);
+            printf("Status: %s\n", (sock_fd >= 0) ? "CONNECTED" : "DISCONNECTED");
+            printf("Hash Rate: %.2f MH/s\n", mhs);
+            printf("Difficulty: %.4f\n", current_diff);
+            printf("Shares Found: %lu\n", atomic_load(&carg->share_queue->found_total));
+            printf("Shares Accepted: %lu\n", atomic_load(&carg->shares_accepted));
+            printf("Shares Rejected: %lu\n", atomic_load(&carg->shares_rejected));
+            printf("Stale Shares: %lu\n", atomic_load(&carg->shares_stale));
+            printf("Reconnects: %lu\n\n", atomic_load(&carg->reconnect_count));
+            fflush(stdout);
+
+            last_telemetry = now;
+            last_hash_count = current_hashes;
+        }
+    }
+
+    if (sock_fd >= 0) close(sock_fd);
+    return NULL;
+}
+
+/* Top-level Stratum mining session coordinator */
+static void run_stratum_miner(const char *pool_url, const char *user, const char *pass,
+                              int num_threads, int core_offset, int pin_enabled,
+                              int control_core) {
+    printf("======================================================================\n");
+    printf("Starting Amlogic S905X Stratum V1 Bitcoin Miner  [backend: %s]\n", backend_name);
+    printf("======================================================================\n");
+    printf("Pool URL          : %s\n", pool_url);
+    printf("Worker User       : %s\n", user);
+    printf("Hashing Threads   : %d\n", num_threads);
+    printf("Control Core      : %d\n", control_core);
+    printf("Core Pinning      : %s (offset: %d)\n", pin_enabled ? "ENABLED" : "DISABLED", core_offset);
+    printf("======================================================================\n\n");
+
+    signal(SIGINT, handle_miner_sig);
+    signal(SIGTERM, handle_miner_sig);
+
+    atomic_int stop_flag;
+    atomic_init(&stop_flag, 0);
+
+    shared_stratum_work_t shared_work;
+    shared_stratum_work_init(&shared_work);
+
+    stratum_share_queue_t share_queue;
+    stratum_share_queue_init(&share_queue);
+
+    atomic_uint64_t total_hashes;
+    atomic_init(&total_hashes, 0);
+
+    /* Spawn Hashing Worker Threads (pinned to cores 0..2) */
+    pthread_t *worker_threads = (pthread_t *)malloc((size_t)num_threads * sizeof(pthread_t));
+    stratum_worker_arg_t *worker_args = (stratum_worker_arg_t *)malloc((size_t)num_threads * sizeof(stratum_worker_arg_t));
+
+    for (int i = 0; i < num_threads; i++) {
+        worker_args[i].cpu_id = pin_enabled ? (core_offset + i) : -1;
+        worker_args[i].thread_idx = i;
+        worker_args[i].total_threads = num_threads;
+        worker_args[i].stop_flag = &stop_flag;
+        worker_args[i].shared_work = &shared_work;
+        worker_args[i].share_queue = &share_queue;
+        worker_args[i].total_hashes = &total_hashes;
+        pthread_create(&worker_threads[i], NULL, stratum_hash_worker, &worker_args[i]);
+    }
+
+    /* Spawn Control Thread (pinned to core 3) */
+    pthread_t control_thread;
+    stratum_control_arg_t control_arg;
+    control_arg.cpu_id = pin_enabled ? control_core : -1;
+    strncpy(control_arg.pool_url, pool_url, sizeof(control_arg.pool_url) - 1);
+    control_arg.pool_url[sizeof(control_arg.pool_url) - 1] = '\0';
+    strncpy(control_arg.user, user, sizeof(control_arg.user) - 1);
+    control_arg.user[sizeof(control_arg.user) - 1] = '\0';
+    strncpy(control_arg.pass, pass, sizeof(control_arg.pass) - 1);
+    control_arg.pass[sizeof(control_arg.pass) - 1] = '\0';
+    control_arg.stop_flag = &stop_flag;
+    control_arg.shared_work = &shared_work;
+    control_arg.share_queue = &share_queue;
+    control_arg.total_hashes = &total_hashes;
+    atomic_init(&control_arg.shares_accepted, 0);
+    atomic_init(&control_arg.shares_rejected, 0);
+    atomic_init(&control_arg.shares_stale, 0);
+    atomic_init(&control_arg.reconnect_count, 0);
+
+    pthread_create(&control_thread, NULL, stratum_control_worker, &control_arg);
+
+    /* Run control thread until stopped */
+    pthread_join(control_thread, NULL);
+
+    atomic_store(&stop_flag, 1);
+    for (int i = 0; i < num_threads; i++) {
+        pthread_join(worker_threads[i], NULL);
+    }
+
+    shared_stratum_work_destroy(&shared_work);
+    stratum_share_queue_destroy(&share_queue);
+    free(worker_threads);
+    free(worker_args);
+}
+
+/* Benchmark worker thread argument */
 typedef struct {
     uint64_t start_nonce;
     uint64_t count;
     int      cpu_id;
     uint8_t  final_hash[32];
-    shared_job_t  *job;
-    share_queue_t *shares;
-    int            share_zero_bits;
 } bench_thread_arg_t;
-
-#define JOB_CHECK_MASK 0x1FFFu /* re-check job version every 8192 nonces */
 
 static void *bench_worker(void *arg) {
     bench_thread_arg_t *targ = (bench_thread_arg_t *)arg;
@@ -1013,51 +1601,17 @@ static void *bench_worker(void *arg) {
     uint8_t hash[32];
     memset(hash, 0, 32);
 
-    if (targ->job == NULL) {
-        /* ---- Fixed-header mode with Midstate Optimization ---- */
-        const char *b125552_hex = "0100000081cd02ab7e569e8bcd9317e2fe99f2de44d49ab2b8851ba4a308000000000000e320b6c2fffc8d750423db8b1eb942ae710e951ed797f7affc8892b0f1fc122bc7f5d74df2b9441a42a14695";
-        uint8_t header_buf[80];
-        hex_to_bytes(b125552_hex, header_buf, 80);
+    const char *b125552_hex = "0100000081cd02ab7e569e8bcd9317e2fe99f2de44d49ab2b8851ba4a308000000000000e320b6c2fffc8d750423db8b1eb942ae710e951ed797f7affc8892b0f1fc122bc7f5d74df2b9441a42a14695";
+    uint8_t header_buf[80];
+    hex_to_bytes(b125552_hex, header_buf, 80);
 
-        /* Precompute midstate ONCE for the entire nonce range */
-        bitcoin_midstate_t ms;
-        bitcoin_midstate_init(&ms, header_buf);
+    /* Precompute midstate ONCE for the benchmark range */
+    bitcoin_midstate_t ms;
+    bitcoin_midstate_init(&ms, header_buf);
 
-        for (uint64_t i = 0; i < targ->count; i++) {
-            uint32_t nonce = (uint32_t)(targ->start_nonce + i);
-            bitcoin_hash_nonce_opt(&ms, nonce, hash);
-        }
-    } else {
-        /* ---- Control-plane-aware mode with Midstate Optimization ---- */
-        uint8_t local_header[80];
-        unsigned local_version = shared_job_load(targ->job, local_header);
-
-        bitcoin_midstate_t ms;
-        bitcoin_midstate_init(&ms, local_header);
-
-        for (uint64_t i = 0; i < targ->count; i++) {
-            if ((i & JOB_CHECK_MASK) == 0) {
-                unsigned v = atomic_load(&targ->job->version);
-                if (v != local_version) {
-                    local_version = shared_job_load(targ->job, local_header);
-                    /* Recompute midstate only when new job arrives */
-                    bitcoin_midstate_init(&ms, local_header);
-                }
-            }
-
-            uint32_t nonce = (uint32_t)(targ->start_nonce + i);
-            bitcoin_hash_nonce_opt(&ms, nonce, hash);
-
-            if (targ->shares && targ->share_zero_bits > 0) {
-                uint32_t lead = ((uint32_t)hash[0] << 24) | ((uint32_t)hash[1] << 16) |
-                                 ((uint32_t)hash[2] << 8) | (uint32_t)hash[3];
-                uint32_t threshold = (targ->share_zero_bits >= 32) ? 0u
-                                    : (0xFFFFFFFFu >> targ->share_zero_bits);
-                if (lead <= threshold) {
-                    share_queue_push(targ->shares, nonce, local_version);
-                }
-            }
-        }
+    for (uint64_t i = 0; i < targ->count; i++) {
+        uint32_t nonce = (uint32_t)(targ->start_nonce + i);
+        bitcoin_hash_nonce_opt(&ms, nonce, hash);
     }
 
     memcpy(targ->final_hash, hash, 32);
@@ -1274,53 +1828,10 @@ static void run_benchmark(uint64_t iterations, int num_threads, int core_offset,
         return;
     }
 
-    shared_job_t job;
-    share_queue_t shares;
-    int control_active = 0;
-    atomic_int control_stop = 0;
-    stub_pool_arg_t stub_arg;
-    control_thread_arg_t control_arg;
-    pthread_t stub_thread_handle, control_thread_handle;
-    int stub_started = 0, control_started = 0;
-
-    if (control_core >= 0) {
-        const char *b125552_hex = "0100000081cd02ab7e569e8bcd9317e2fe99f2de44d49ab2b8851ba4a308000000000000e320b6c2fffc8d750423db8b1eb942ae710e951ed797f7affc8892b0f1fc122bc7f5d74df2b9441a42a14695";
-        uint8_t initial_header[80];
-        hex_to_bytes(b125552_hex, initial_header, 80);
-        shared_job_init(&job, initial_header);
-        share_queue_init(&shares);
-        control_active = 1;
-
-        stub_arg.stop_flag = &control_stop;
-        atomic_init(&stub_arg.ready, 0);
-        stub_arg.port = -1;
-        if (pthread_create(&stub_thread_handle, NULL, stub_pool_thread, &stub_arg) == 0) {
-            stub_started = 1;
-            for (int spins = 0; spins < 200 && !atomic_load(&stub_arg.ready); spins++) {
-                usleep(5000);
-            }
-        } else {
-            fprintf(stderr, "Warning: failed to start stub-pool thread.\n");
-        }
-
-        control_arg.cpu_id = control_core;
-        control_arg.stop_flag = &control_stop;
-        control_arg.job = &job;
-        control_arg.shares = &shares;
-        control_arg.stub_port = stub_arg.port;
-        control_arg.job_interval_ms = job_interval_ms;
-        control_arg.reconnect_interval_ms = reconnect_interval_ms;
-        atomic_init(&control_arg.job_updates, 0);
-        atomic_init(&control_arg.shares_submitted, 0);
-        atomic_init(&control_arg.reconnects, 0);
-        if (stub_started && stub_arg.port >= 0) {
-            if (pthread_create(&control_thread_handle, NULL, control_worker, &control_arg) == 0) {
-                control_started = 1;
-            } else {
-                fprintf(stderr, "Warning: failed to start control thread on core %d.\n", control_core);
-            }
-        }
-    }
+    (void)control_core;
+    (void)job_interval_ms;
+    (void)reconnect_interval_ms;
+    (void)share_zero_bits;
 
     uint64_t base = iterations / (uint64_t)num_threads;
     uint64_t remainder = iterations % (uint64_t)num_threads;
@@ -1329,9 +1840,6 @@ static void run_benchmark(uint64_t iterations, int num_threads, int core_offset,
         args[t].start_nonce = cursor;
         args[t].count = base + ((uint64_t)t < remainder ? 1 : 0);
         args[t].cpu_id = pin_enabled ? (int)((core_offset + t) % total_cores) : -1;
-        args[t].job = control_active ? &job : NULL;
-        args[t].shares = control_active ? &shares : NULL;
-        args[t].share_zero_bits = share_zero_bits;
         cursor += args[t].count;
     }
 
@@ -1375,12 +1883,6 @@ static void run_benchmark(uint64_t iterations, int num_threads, int core_offset,
         pthread_join(spin_thread, NULL);
     }
 
-    if (control_active) {
-        atomic_store(&control_stop, 1);
-        if (control_started) pthread_join(control_thread_handle, NULL);
-        if (stub_started) pthread_join(stub_thread_handle, NULL);
-    }
-
     double elapsed_sec = (double)(end_time.tv_sec - start_time.tv_sec) +
                          (double)(end_time.tv_nsec - start_time.tv_nsec) / 1e9;
 
@@ -1404,20 +1906,8 @@ static void run_benchmark(uint64_t iterations, int num_threads, int core_offset,
     if (freq_before >= 0 && freq_after >= 0) {
         printf("  CPU0 Freq (MHz) : %.0f -> %.0f\n", freq_before / 1000.0, freq_after / 1000.0);
     }
-    if (control_active) {
-        printf("  Job Updates     : %lu\n", atomic_load(&control_arg.job_updates));
-        printf("  Shares Found    : %lu\n", atomic_load(&shares.found_total));
-        printf("  Shares Submitted: %lu\n", atomic_load(&control_arg.shares_submitted));
-        printf("  Shares Dropped  : %lu\n", atomic_load(&shares.dropped_total));
-        printf("  Reconnects      : %lu\n", atomic_load(&control_arg.reconnects));
-    }
     printf("  Sample Hash     : %s (from last worker's final nonce)\n", final_hex);
     printf("======================================================================\n");
-
-    if (control_active) {
-        shared_job_destroy(&job);
-        share_queue_destroy(&shares);
-    }
 
     free(args);
     free(threads);
@@ -1429,38 +1919,34 @@ static void run_benchmark(uint64_t iterations, int num_threads, int core_offset,
 
 static void print_usage(const char *prog_name) {
     printf("Usage: %s [options]\n", prog_name);
-    printf("Options:\n");
+    printf("Mining Options:\n");
+    printf("  -M, --mine              Run live Stratum V1 Bitcoin miner.\n");
+    printf("  -P, --pool <URL>        Stratum pool URL (e.g. stratum+tcp://solo.ckpool.org:3333).\n");
+    printf("  -u, -U, --user <USER>   Stratum worker username / BTC address.\n");
+    printf("  -p, --pass, --password  Stratum worker password (default: x).\n");
+    printf("  -j, --threads <N>       Hashing worker threads pinned to cores (default: 3 on 4-core).\n");
+    printf("  -c, --control-core <N>  Control/network core (default: 3 on 4-core).\n");
+    printf("  -o, --offset <N>        First CPU core to pin hash threads to (default: 0).\n");
+    printf("  --no-pin                Disable CPU pinning.\n");
+    printf("Diagnostic & Benchmark Options:\n");
     printf("  -t, --test              Run known Bitcoin block header correctness tests.\n");
     printf("  -b, --benchmark         Run proof-of-work nonce hashing benchmark.\n");
     printf("  -n, --iterations <N>    Number of benchmark iterations (default: 5000000).\n");
-    printf("  -j, --threads <N>       Worker threads for benchmark (default: all online cores).\n");
-    printf("  -o, --offset <N>        First CPU core to pin threads to (default: 0). Implies pinning.\n");
-    printf("  -p, --no-pin            Disable CPU pinning; let the OS scheduler place threads.\n");
-    printf("  -x, --spin-core <N>     Diagnostic: run a dummy busy-spin thread pinned to core N\n");
-    printf("                          alongside the hash workers (no memory/crypto traffic).\n");
-    printf("                          Used to isolate generic contention from crypto-specific\n");
-    printf("                          contention. Default: disabled.\n");
-    printf("  -y, --spin-duty <P>     Duty cycle percent (0-100) for the spin thread, in ~20ms\n");
-    printf("                          cycles of busy/sleep. Only meaningful with -x. Default: 100.\n");
-    printf("  -m, --spin-mode <M>     Workload type for the spin thread: alu, loadstore, membw,\n");
-    printf("                          neon, sha. Only meaningful with -x. Default: alu.\n");
-    printf("  -c, --control-core <N>  Real mining-architecture mode: pin a genuine Stratum-style\n");
-    printf("                          control thread (job polling, share submission, reconnects,\n");
-    printf("                          over a real loopback TCP socket) to core N, instead of the\n");
-    printf("                          synthetic -x spin thread. Mutually exclusive with -x.\n");
-    printf("  -J, --job-interval <ms> How often the control thread polls for a new job. Only\n");
-    printf("                          meaningful with -c. Default: 250.\n");
-    printf("  -R, --reconnect <ms>    How often the control thread simulates a pool reconnect.\n");
-    printf("                          0 disables reconnect simulation. Only meaningful with -c.\n");
-    printf("                          Default: 5000.\n");
-    printf("  -z, --share-bits <N>    Synthetic share-target strictness: a hash is a \"share\" if\n");
-    printf("                          its leading N bits are zero (~1-in-2^N hashes). Only\n");
-    printf("                          meaningful with -c. Default: 24 (~20 shares/min at 5.8MH/s).\n");
+    printf("  -x, --spin-core <N>     Diagnostic: run a dummy busy-spin thread pinned to core N.\n");
+    printf("  -y, --spin-duty <P>     Duty cycle percent (0-100) for the spin thread. Default: 100.\n");
+    printf("  -m, --spin-mode <M>     Workload type for the spin thread: alu, loadstore, membw, neon, sha.\n");
+    printf("  -J, --job-interval <ms> Diagnostic: benchmark control thread job polling interval. Default: 250.\n");
+    printf("  -R, --reconnect <ms>    Diagnostic: benchmark control thread reconnect interval. Default: 5000.\n");
+    printf("  -z, --share-bits <N>    Diagnostic: benchmark synthetic share-target bits. Default: 24.\n");
     printf("  -s, --sw-only           Force the portable software backend (disable HW crypto).\n");
     printf("  -h, --help              Display this help message.\n");
 }
 
 int main(int argc, char *argv[]) {
+    int do_mine = 0;
+    char pool_url[256] = "stratum+tcp://solo.ckpool.org:3333";
+    char pool_user[256] = "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh.s905x";
+    char pool_pass[256] = "x";
     int do_test = 0;
     int do_benchmark = 0;
     int force_sw = 0;
@@ -1485,7 +1971,34 @@ int main(int argc, char *argv[]) {
     }
 
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--test") == 0) {
+        if (strcmp(argv[i], "-M") == 0 || strcmp(argv[i], "--mine") == 0) {
+            do_mine = 1;
+        } else if (strcmp(argv[i], "-P") == 0 || strcmp(argv[i], "--pool") == 0) {
+            if (i + 1 < argc) {
+                strncpy(pool_url, argv[++i], sizeof(pool_url) - 1);
+                pool_url[sizeof(pool_url) - 1] = '\0';
+                do_mine = 1;
+            } else {
+                fprintf(stderr, "Error: Option %s requires a URL argument.\n", argv[i]);
+                return 1;
+            }
+        } else if (strcmp(argv[i], "-u") == 0 || strcmp(argv[i], "-U") == 0 || strcmp(argv[i], "--user") == 0) {
+            if (i + 1 < argc) {
+                strncpy(pool_user, argv[++i], sizeof(pool_user) - 1);
+                pool_user[sizeof(pool_user) - 1] = '\0';
+            } else {
+                fprintf(stderr, "Error: Option %s requires a username argument.\n", argv[i]);
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--password") == 0 || strcmp(argv[i], "--pass") == 0) {
+            if (i + 1 < argc) {
+                strncpy(pool_pass, argv[++i], sizeof(pool_pass) - 1);
+                pool_pass[sizeof(pool_pass) - 1] = '\0';
+            } else {
+                fprintf(stderr, "Error: Option %s requires a password argument.\n", argv[i]);
+                return 1;
+            }
+        } else if (strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--test") == 0) {
             do_test = 1;
         } else if (strcmp(argv[i], "-b") == 0 || strcmp(argv[i], "--benchmark") == 0) {
             do_benchmark = 1;
@@ -1522,7 +2035,7 @@ int main(int argc, char *argv[]) {
                 fprintf(stderr, "Error: Option %s requires an integer argument.\n", argv[i]);
                 return 1;
             }
-        } else if (strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--no-pin") == 0) {
+        } else if (strcmp(argv[i], "--no-pin") == 0) {
             pin_enabled = 0;
         } else if (strcmp(argv[i], "-x") == 0 || strcmp(argv[i], "--spin-core") == 0) {
             if (i + 1 < argc) {
@@ -1686,6 +2199,10 @@ int main(int argc, char *argv[]) {
     if (do_benchmark) {
         run_benchmark(iterations, num_threads, core_offset, pin_enabled, spin_core, spin_duty, spin_mode,
                       control_core, job_interval_ms, reconnect_interval_ms, share_zero_bits);
+    }
+
+    if (do_mine) {
+        run_stratum_miner(pool_url, pool_user, pool_pass, num_threads, core_offset, pin_enabled, control_core);
     }
 
     return test_result;

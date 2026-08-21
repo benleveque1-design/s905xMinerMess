@@ -22,6 +22,7 @@ import argparse
 import subprocess
 import threading
 import signal
+import re
 
 try:
     import asyncio
@@ -59,6 +60,7 @@ class S905XWorkerAgent:
         self.shares_found = 0
         self.shares_accepted = 0
         self.shares_rejected = 0
+        self.current_diff = 1.0
         self.start_time = time.time()
         self.uptime_start = time.time()
         self.miner_process = None
@@ -102,28 +104,47 @@ class S905XWorkerAgent:
         if self.miner_process and self.miner_process.poll() is None:
             return True, "Miner already running"
 
-        if not os.path.exists(self.miner_path):
+        # Resolve miner binary path with fallback search
+        resolved_path = self.miner_path
+        if not os.path.exists(resolved_path):
+            candidates = [
+                os.path.join(os.path.dirname(__file__), "..", "bitcoin_sha256d_s905x"),
+                os.path.join(os.path.dirname(__file__), "bitcoin_sha256d_s905x"),
+                os.path.join(os.getcwd(), "bitcoin_sha256d_s905x"),
+                os.path.join(os.getcwd(), "s905x-miner", "bitcoin_sha256d_s905x")
+            ]
+            for c in candidates:
+                if os.path.exists(c):
+                    resolved_path = os.path.abspath(c)
+                    self.miner_path = resolved_path
+                    break
+
+        if not os.path.exists(resolved_path):
             self.state = "ERROR"
             return False, f"Miner binary '{self.miner_path}' not found. Please compile it first with 'make'."
 
         cmd = [
-            self.miner_path,
+            resolved_path,
+            "--mine",
             "-j", str(self.threads),
             "-c", str(self.control_core)
         ]
         
         # Check if live pool is configured
-        if self.pool and self.pool.get("url") and "stratum" in self.pool.get("url", ""):
+        if self.pool and self.pool.get("url"):
+            pool_url = self.pool.get("url", "stratum+tcp://solo.ckpool.org:3333")
+            pool_user = self.pool.get("user", "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh.s905x")
+            pool_pass = self.pool.get("pass", "x")
             cmd.extend([
-                "-s", self.pool.get("url"),
-                "-u", self.pool.get("user", "x"),
-                "-p", self.pool.get("pass", "x")
+                "--pool", pool_url,
+                "--user", pool_user,
+                "--password", pool_pass
             ])
         else:
-            # Standalone benchmark loop mode
             cmd.extend(["-b", "-n", "1000000000"])
         
         try:
+            print(f"[Agent] Launching miner: {' '.join(cmd)}")
             self.miner_process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -166,30 +187,58 @@ class S905XWorkerAgent:
         if not self.miner_process:
             return
         
-        for line in iter(self.miner_process.stdout.readline, ''):
-            line = line.strip()
+        for raw_line in iter(self.miner_process.stdout.readline, ''):
+            line = raw_line.strip()
             if not line:
                 continue
             
-            # Parse hashrate lines like: "Total Hashrate: 9.87 MH/s"
-            if "MH/s" in line or "Mhash" in line or "hashrate" in line.lower():
-                parts = line.split()
-                for p in parts:
-                    try:
-                        val = float(p)
-                        if 0.1 < val < 500.0:
-                            self.hashrate_mhs = round(val, 2)
-                            break
-                    except ValueError:
-                        continue
+            # Print to agent stdout for local debugging
+            print(f"[Miner] {line}")
             
-            # Parse share submissions
-            if "share" in line.lower() or "target" in line.lower():
-                self.shares_found += 1
-                if "accepted" in line.lower() or "pass" in line.lower() or "valid" in line.lower():
-                    self.shares_accepted += 1
-                elif "reject" in line.lower():
-                    self.shares_rejected += 1
+            # 1. Parse Hash Rate line: "Hash Rate: 8.95 MH/s" or "Total Hashrate: 9.87 MH/s"
+            if "Hash Rate:" in line or "hashrate" in line.lower() or "MH/s" in line:
+                match = re.search(r'([0-9]+(?:\.[0-9]+)?)\s*MH/s', line, re.IGNORECASE)
+                if match:
+                    try:
+                        self.hashrate_mhs = round(float(match.group(1)), 2)
+                    except ValueError:
+                        pass
+                else:
+                    parts = line.split()
+                    for p in parts:
+                        try:
+                            val = float(p)
+                            if 0.01 <= val < 1000.0:
+                                self.hashrate_mhs = round(val, 2)
+                                break
+                        except ValueError:
+                            continue
+            
+            # 2. Parse exact telemetry stats lines from C miner
+            if line.startswith("Shares Found:"):
+                try:
+                    self.shares_found = int(line.split(":", 1)[1].strip())
+                except (ValueError, IndexError):
+                    pass
+            elif line.startswith("Shares Accepted:"):
+                try:
+                    self.shares_accepted = int(line.split(":", 1)[1].strip())
+                except (ValueError, IndexError):
+                    pass
+            elif line.startswith("Shares Rejected:"):
+                try:
+                    self.shares_rejected = int(line.split(":", 1)[1].strip())
+                except (ValueError, IndexError):
+                    pass
+            elif line.startswith("Difficulty:"):
+                try:
+                    self.current_diff = float(line.split(":", 1)[1].strip())
+                except (ValueError, IndexError):
+                    pass
+            elif line.startswith("Status:"):
+                status_str = line.split(":", 1)[1].strip()
+                if "CONNECTED" in status_str and self.state != "RUNNING":
+                    self.state = "RUNNING"
 
         if self.state == "RUNNING" and self.miner_process and self.miner_process.poll() is not None:
             self.state = "STOPPED"
@@ -323,11 +372,11 @@ class S905XWorkerAgent:
 
 def main():
     parser = argparse.ArgumentParser(description="S905X Bitcoin Mining Worker Agent")
-    parser.add_argument("--server", default="ws://192.168.1.100:3000/ws/worker", help="Controller WebSocket URL")
-    parser.add_argument("--id", default=f"s905x-{socket.gethostname()}", help="Unique Worker ID")
-    parser.add_argument("--token", default="s905x_secret_token", help="Shared Auth Token")
-    parser.add_argument("--name", default="", help="Friendly worker name")
-    parser.add_argument("--miner", default="./bitcoin_sha256d_s905x", help="Path to miner binary")
+    parser.add_argument("--server", default=os.getenv("CONTROLLER_WS_URL", "ws://192.168.1.156:3010/ws/worker"), help="Controller WebSocket URL")
+    parser.add_argument("--id", default=os.getenv("WORKER_ID", "s905x-real-01"), help="Unique Worker ID")
+    parser.add_argument("--token", default=os.getenv("AUTH_TOKEN", "s905x_secret_token"), help="Shared Auth Token")
+    parser.add_argument("--name", default=os.getenv("WORKER_NAME", "Amlogic S905X Miner"), help="Friendly worker name")
+    parser.add_argument("--miner", default=os.getenv("MINER_BIN", "bitcoin_sha256d_s905x"), help="Path to miner binary")
     parser.add_argument("--autostart", action="store_true", help="Automatically start mining upon launch")
     args = parser.parse_args()
 

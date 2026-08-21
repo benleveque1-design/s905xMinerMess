@@ -1,18 +1,16 @@
 export const S905X_PYTHON_AGENT = `#!/usr/bin/env python3
 """
 S905X Bitcoin Mining Worker Agent
-Lightweight daemon for Amlogic S905X (Armbian / Linux / AArch64)
+Lightweight outbound telemetry & process supervisor daemon for Amlogic S905X (Armbian / Linux / AArch64)
 
 Features:
-- Initiates outbound persistent WebSocket connection to central controller
-- Reports hardware telemetry (CPU temp, scaling frequency, 4-core load)
+- Initiates outbound persistent WebSocket connection to central Ubuntu Controller (/ws/worker)
+- Reports hardware telemetry (CPU temp, scaling frequency, core load)
 - Supervises the native 'bitcoin_sha256d_s905x' binary
-- Receives dynamic commands (start, stop, restart, set_threads, set_pool)
+- Default optimal configuration on 4-core Cortex-A53: 3 hashing threads (cores 0, 1, 2) + 1 control core (core 3)
+- Dynamic remote commands (start, stop, restart, set_threads, set_pool, rename)
 - Automatic reconnection with exponential backoff
-- Zero external dependencies beyond standard library + 'websockets' or minimal ws client
-
-Usage:
-  python3 s905x_agent.py --server ws://192.168.1.100:3010/ws/worker --id s905x-01 --token s905x_secret_token
+- Clean signal handling (SIGINT / SIGTERM)
 """
 
 import sys
@@ -24,16 +22,17 @@ import argparse
 import subprocess
 import threading
 import signal
+import re
 
 try:
-    import urllib.request
     import asyncio
     import websockets
 except ImportError:
-    print("Installing required lightweight dependency 'websockets'...")
+    print("[Agent] Installing required dependency 'websockets' via pip...")
     subprocess.check_call([sys.executable, "-m", "pip", "install", "websockets"])
     import websockets
     import asyncio
+
 
 class S905XWorkerAgent:
     def __init__(self, server_url, worker_id, token, worker_name, miner_path):
@@ -41,12 +40,15 @@ class S905XWorkerAgent:
         self.worker_id = worker_id
         self.token = token
         self.worker_name = worker_name or f"S905X-{socket.gethostname()}"
-        self.miner_path = miner_path
+        self.miner_path = os.path.abspath(miner_path)
         
         # State
         self.state = "STOPPED"  # RUNNING, STOPPED, ERROR, RESTARTING
-        self.threads = 4
         self.max_cores = os.cpu_count() or 4
+        # Optimal default on 4-core S905X: 3 hashing cores + 1 control core
+        self.threads = 3 if self.max_cores >= 4 else max(1, self.max_cores - 1)
+        self.control_core = 3 if self.max_cores >= 4 else max(0, self.max_cores - 1)
+        
         self.pool = {
             "url": "stratum+tcp://solo.ckpool.org:3333",
             "user": "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh.s905x",
@@ -58,6 +60,7 @@ class S905XWorkerAgent:
         self.shares_found = 0
         self.shares_accepted = 0
         self.shares_rejected = 0
+        self.current_diff = 1.0
         self.start_time = time.time()
         self.uptime_start = time.time()
         self.miner_process = None
@@ -79,7 +82,7 @@ class S905XWorkerAgent:
                         return round(raw / 1000.0, 1) if raw > 1000 else float(raw)
                 except Exception:
                     pass
-        return 48.5 # Fallback
+        return 48.5
 
     def get_cpu_freq(self):
         """Read S905X CPU current scaling frequency in MHz"""
@@ -94,25 +97,54 @@ class S905XWorkerAgent:
                         return int(int(f.read().strip()) / 1000)
                 except Exception:
                     pass
-        return 1512 # Standard S905X Cortex-A53 1.512 GHz
+        return 1512  # Standard S905X Cortex-A53 1.512 GHz
 
     def start_miner(self):
         """Spawn the native C bitcoin_sha256d_s905x process"""
         if self.miner_process and self.miner_process.poll() is None:
             return True, "Miner already running"
 
-        if not os.path.exists(self.miner_path):
+        # Resolve miner binary path with fallback search
+        resolved_path = self.miner_path
+        if not os.path.exists(resolved_path):
+            candidates = [
+                os.path.join(os.path.dirname(__file__), "..", "bitcoin_sha256d_s905x"),
+                os.path.join(os.path.dirname(__file__), "bitcoin_sha256d_s905x"),
+                os.path.join(os.getcwd(), "bitcoin_sha256d_s905x"),
+                os.path.join(os.getcwd(), "s905x-miner", "bitcoin_sha256d_s905x")
+            ]
+            for c in candidates:
+                if os.path.exists(c):
+                    resolved_path = os.path.abspath(c)
+                    self.miner_path = resolved_path
+                    break
+
+        if not os.path.exists(resolved_path):
             self.state = "ERROR"
-            return False, f"Miner binary '{self.miner_path}' not found"
+            return False, f"Miner binary '{self.miner_path}' not found. Please compile it first with 'make'."
 
         cmd = [
-            self.miner_path,
-            "-b",
+            resolved_path,
+            "--mine",
             "-j", str(self.threads),
-            "-n", "100000000"
+            "-c", str(self.control_core)
         ]
         
+        # Check if live pool is configured
+        if self.pool and self.pool.get("url"):
+            pool_url = self.pool.get("url", "stratum+tcp://solo.ckpool.org:3333")
+            pool_user = self.pool.get("user", "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh.s905x")
+            pool_pass = self.pool.get("pass", "x")
+            cmd.extend([
+                "--pool", pool_url,
+                "--user", pool_user,
+                "--password", pool_pass
+            ])
+        else:
+            cmd.extend(["-b", "-n", "1000000000"])
+        
         try:
+            print(f"[Agent] Launching miner: {' '.join(cmd)}")
             self.miner_process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -126,7 +158,7 @@ class S905XWorkerAgent:
             # Start reader thread
             self.miner_stdout_thread = threading.Thread(target=self._read_miner_output, daemon=True)
             self.miner_stdout_thread.start()
-            return True, f"Miner started with {self.threads} threads"
+            return True, f"Miner started with {self.threads} hashing threads on core {self.control_core} control"
         except Exception as e:
             self.state = "ERROR"
             return False, f"Failed to start miner: {e}"
@@ -154,32 +186,59 @@ class S905XWorkerAgent:
         if not self.miner_process:
             return
         
-        for line in iter(self.miner_process.stdout.readline, ''):
-            line = line.strip()
+        for raw_line in iter(self.miner_process.stdout.readline, ''):
+            line = raw_line.strip()
             if not line:
                 continue
             
-            # Parse hashrate lines like: "Total Hashrate: 4.18 MH/s" or "4.20 MH/s"
-            if "MH/s" in line or "Mhash" in line or "hashrate" in line.lower():
-                parts = line.split()
-                for i, p in enumerate(parts):
-                    try:
-                        val = float(p)
-                        if val > 0.1 and val < 500.0:
-                            self.hashrate_mhs = round(val, 2)
-                            break
-                    except ValueError:
-                        continue
+            print(f"[Miner] {line}")
             
-            # Parse share submissions
-            if "share" in line.lower() or "found" in line.lower():
-                self.shares_found += 1
-                if "accepted" in line.lower() or "diff" in line.lower() or "pass" in line.lower():
-                    self.shares_accepted += 1
-                elif "reject" in line.lower():
-                    self.shares_rejected += 1
+            # 1. Parse Hash Rate line: "Hash Rate: 8.95 MH/s" or "Total Hashrate: 9.87 MH/s"
+            if "Hash Rate:" in line or "hashrate" in line.lower() or "MH/s" in line:
+                match = re.search(r'([0-9]+(?:\.[0-9]+)?)\s*MH/s', line, re.IGNORECASE)
+                if match:
+                    try:
+                        self.hashrate_mhs = round(float(match.group(1)), 2)
+                    except ValueError:
+                        pass
+                else:
+                    parts = line.split()
+                    for p in parts:
+                        try:
+                            val = float(p)
+                            if 0.01 <= val < 1000.0:
+                                self.hashrate_mhs = round(val, 2)
+                                break
+                        except ValueError:
+                            continue
+            
+            # 2. Parse exact telemetry stats lines from C miner
+            if line.startswith("Shares Found:"):
+                try:
+                    self.shares_found = int(line.split(":", 1)[1].strip())
+                except (ValueError, IndexError):
+                    pass
+            elif line.startswith("Shares Accepted:"):
+                try:
+                    self.shares_accepted = int(line.split(":", 1)[1].strip())
+                except (ValueError, IndexError):
+                    pass
+            elif line.startswith("Shares Rejected:"):
+                try:
+                    self.shares_rejected = int(line.split(":", 1)[1].strip())
+                except (ValueError, IndexError):
+                    pass
+            elif line.startswith("Difficulty:"):
+                try:
+                    self.current_diff = float(line.split(":", 1)[1].strip())
+                except (ValueError, IndexError):
+                    pass
+            elif line.startswith("Status:"):
+                status_str = line.split(":", 1)[1].strip()
+                if "CONNECTED" in status_str and self.state != "RUNNING":
+                    self.state = "RUNNING"
 
-        if self.state == "RUNNING" and self.miner_process.poll() is not None:
+        if self.state == "RUNNING" and self.miner_process and self.miner_process.poll() is not None:
             self.state = "STOPPED"
             self.hashrate_mhs = 0.0
 
@@ -205,7 +264,7 @@ class S905XWorkerAgent:
             status = "ok" if ok else "error"
             message = msg
         elif action == "set_threads":
-            new_threads = int(params.get("threads", 4))
+            new_threads = int(params.get("threads", 3))
             self.threads = max(1, min(self.max_cores, new_threads))
             if self.state == "RUNNING":
                 self.restart_miner()
@@ -255,17 +314,13 @@ class S905XWorkerAgent:
                         "cores": self.max_cores,
                         "arch": "aarch64 Cortex-A53",
                         "hwCrypto": True,
-                        "agentVersion": "1.0.0"
+                        "agentVersion": "2.0.0"
                     }
                     await ws.send(json.dumps(auth_msg))
 
-                    # 2. Telemetry and receiver loops
+                    # 2. Telemetry sender loop
                     async def send_telemetry_loop():
                         while True:
-                            # If running without process stdout (e.g. initial test benchmark), compute realistic baseline
-                            if self.state == "RUNNING" and self.hashrate_mhs == 0.0:
-                                self.hashrate_mhs = round(1.05 * self.threads, 2)
-                            
                             telemetry = {
                                 "type": "telemetry",
                                 "workerId": self.worker_id,
@@ -285,6 +340,7 @@ class S905XWorkerAgent:
                             await ws.send(json.dumps(telemetry))
                             await asyncio.sleep(2.0)
 
+                    # 3. Downstream command listener loop
                     async def receive_commands_loop():
                         async for raw_msg in ws:
                             try:
@@ -294,27 +350,28 @@ class S905XWorkerAgent:
                                 if msg_type == "command":
                                     await self.handle_command(ws, msg)
                                 elif msg_type == "auth_ack":
-                                    print(f"[Agent] Server authenticated: {msg.get('status')}")
+                                    print(f"[Agent] Authenticated with controller: {msg.get('status')}")
                                     if "pool" in msg:
                                         self.pool.update(msg["pool"])
                             except Exception as e:
                                 print(f"[Agent] Error processing message: {e}")
 
-                    # Run both tasks concurrently
                     await asyncio.gather(send_telemetry_loop(), receive_commands_loop())
                     
             except (websockets.exceptions.ConnectionClosed, socket.error, Exception) as e:
-                print(f"[Agent] Connection error: {e}. Reconnecting in {backoff:.1f}s...")
+                print(f"[Agent] Connection to {self.server_url} lost ({e}). Retrying in {backoff:.1f}s...")
                 await asyncio.sleep(backoff)
                 backoff = min(30.0, backoff * 1.5)
 
+
 def main():
     parser = argparse.ArgumentParser(description="S905X Bitcoin Mining Worker Agent")
-    parser.add_argument("--server", default="ws://192.168.1.100:3010/ws/worker", help="Controller WebSocket URL")
-    parser.add_argument("--id", default=f"s905x-{socket.gethostname()}", help="Unique Worker ID")
-    parser.add_argument("--token", default="s905x_secret_token", help="Shared Auth Token")
-    parser.add_argument("--name", default="", help="Friendly worker name")
-    parser.add_argument("--miner", default="./bitcoin_sha256d_s905x", help="Path to miner binary")
+    parser.add_argument("--server", default=os.getenv("CONTROLLER_WS_URL", "ws://192.168.1.156:3010/ws/worker"), help="Controller WebSocket URL")
+    parser.add_argument("--id", default=os.getenv("WORKER_ID", "s905x-real-01"), help="Unique Worker ID")
+    parser.add_argument("--token", default=os.getenv("AUTH_TOKEN", "s905x_secret_token"), help="Shared Auth Token")
+    parser.add_argument("--name", default=os.getenv("WORKER_NAME", "Amlogic S905X Miner"), help="Friendly worker name")
+    parser.add_argument("--miner", default=os.getenv("MINER_BIN", "bitcoin_sha256d_s905x"), help="Path to miner binary")
+    parser.add_argument("--autostart", action="store_true", help="Automatically start mining upon launch")
     args = parser.parse_args()
 
     agent = S905XWorkerAgent(
@@ -324,6 +381,9 @@ def main():
         worker_name=args.name,
         miner_path=args.miner
     )
+
+    if args.autostart:
+        agent.start_miner()
 
     def handle_exit(signum, frame):
         print("\\n[Agent] Shutting down...")
@@ -335,6 +395,7 @@ def main():
     signal.signal(signal.SIGTERM, handle_exit)
 
     asyncio.run(agent.run())
+
 
 if __name__ == "__main__":
     main()
@@ -349,7 +410,7 @@ Wants=network-online.target
 Type=simple
 User=root
 WorkingDirectory=/root
-ExecStart=/usr/bin/python3 /root/s905x_agent.py --server ws://192.168.1.100:3010/ws/worker --id s905x-box-01 --token s905x_secret_token --miner /root/bitcoin_sha256d_s905x
+ExecStart=/usr/bin/python3 /root/s905x_agent.py --server ws://192.168.1.156:3010/ws/worker --id s905x-real-01 --token s905x_secret_token --miner /root/bitcoin_sha256d_s905x
 Restart=always
 RestartSec=5
 KillMode=mixed
