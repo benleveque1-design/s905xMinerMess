@@ -1,11 +1,27 @@
+import "dotenv/config";
 import express from "express";
 import http from "http";
 import path from "path";
+import crypto from "crypto";
 import { WebSocketServer, WebSocket } from "ws";
 import { createServer as createViteServer } from "vite";
 
 const PORT = Number(process.env.PORT) || 3010;
-const AUTH_TOKEN = "s905x_secret_token";
+const AUTH_TOKEN = process.env.WORKER_AUTH_TOKEN;
+
+if (!AUTH_TOKEN) {
+  console.error("[S905X Controller] FATAL: WORKER_AUTH_TOKEN is not set.");
+  console.error("[S905X Controller] Set it via .env (WORKER_AUTH_TOKEN=<secret>) or export it, then restart.");
+  process.exit(1);
+}
+
+// Constant-time token comparison (digests sidestep length leakage)
+function tokenMatches(candidate: unknown): boolean {
+  if (typeof candidate !== "string" || candidate.length === 0) return false;
+  const a = crypto.createHash("sha256").update(candidate).digest();
+  const b = crypto.createHash("sha256").update(AUTH_TOKEN!).digest();
+  return crypto.timingSafeEqual(a, b);
+}
 
 interface WorkerRecord {
   workerId: string;
@@ -275,9 +291,31 @@ function initDefaultSimulators() {
   simulatedWorkers.set("s905x-node-03", new SimulatedWorker("s905x-node-03", "S905X Rack Unit 3 (Cluster Node)"));
 }
 
+// When the first real S905X agent authenticates, retire the demo fleet so the
+// dashboard reflects physical hardware instead of fabricated telemetry.
+let realHardwareSeen = false;
+function destroySimulatedFleet(reason: string) {
+  for (const [id, sim] of simulatedWorkers.entries()) {
+    sim.destroy();
+    simulatedWorkers.delete(id);
+  }
+  if (simulatedWorkers.size === 0) {
+    console.log(`[S905X Controller] Simulated fleet removed: ${reason}`);
+  }
+}
+
 async function startServer() {
   const app = express();
   app.use(express.json());
+
+  // Auth gate for mutating (POST) REST endpoints. Read-only GETs stay open.
+  const requireApiAuth: express.RequestHandler = (req, res, next) => {
+    if (!tokenMatches(req.headers["x-auth-token"])) {
+      res.status(401).json({ error: "Unauthorized: missing or invalid x-auth-token header" });
+      return;
+    }
+    next();
+  };
 
   const server = http.createServer(app);
   const wss = new WebSocketServer({ server });
@@ -350,14 +388,20 @@ async function startServer() {
           const msgType = data.type;
 
           if (msgType === "auth") {
-            const token = data.token;
-            if (token !== AUTH_TOKEN) {
+            if (!tokenMatches(data.token)) {
+              console.warn("[S905X Controller] Rejected worker auth: invalid token");
               ws.close(4001, "Invalid Authentication Token");
               return;
             }
 
             authenticatedWorkerId = data.workerId;
             workerSockets.set(authenticatedWorkerId, ws);
+
+            if (!realHardwareSeen) {
+              realHardwareSeen = true;
+              destroySimulatedFleet(`real worker '${authenticatedWorkerId}' connected`);
+              broadcastToClients({ type: "fleet_sync", workers: Array.from(workers.values()), poolConfig: globalPool });
+            }
 
             const now = Date.now();
             const existing = workers.get(authenticatedWorkerId);
@@ -477,7 +521,7 @@ async function startServer() {
     res.json(Array.from(workers.values()));
   });
 
-  app.post("/api/workers/:id/command", (req, res) => {
+  app.post("/api/workers/:id/command", requireApiAuth, (req, res) => {
     const workerId = req.params.id;
     const command = {
       type: "command",
@@ -495,7 +539,7 @@ async function startServer() {
     res.json(globalPool);
   });
 
-  app.post("/api/pool", (req, res) => {
+  app.post("/api/pool", requireApiAuth, (req, res) => {
     globalPool = { ...globalPool, ...req.body };
     // Broadcast to all workers
     sendWorkerCommand("all", {
@@ -509,7 +553,7 @@ async function startServer() {
   });
 
   // Simulator Endpoints
-  app.post("/api/simulator/spawn", (req, res) => {
+  app.post("/api/simulator/spawn", requireApiAuth, (req, res) => {
     const count = simulatedWorkers.size + 1;
     const id = `s905x-sim-${count}`;
     const name = req.body.name || `S905X Node 0${count}`;
@@ -518,7 +562,7 @@ async function startServer() {
     res.json({ success: true, workerId: id, name });
   });
 
-  app.post("/api/simulator/kill", (req, res) => {
+  app.post("/api/simulator/kill", requireApiAuth, (req, res) => {
     const id = req.body.workerId;
     const sim = simulatedWorkers.get(id);
     if (sim) {

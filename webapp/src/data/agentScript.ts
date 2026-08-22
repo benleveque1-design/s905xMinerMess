@@ -27,11 +27,12 @@ import re
 try:
     import asyncio
     import websockets
-except ImportError:
-    print("[Agent] Installing required dependency 'websockets' via pip...")
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "websockets"])
-    import websockets
-    import asyncio
+except ImportError as exc:
+    print("[Agent] FATAL: required dependency 'websockets' is not installed.", file=sys.stderr)
+    print("[Agent] Install it before starting the agent, e.g.:", file=sys.stderr)
+    print("[Agent]   sudo apt install python3-websockets", file=sys.stderr)
+    print("[Agent]   python3 -m pip install -r requirements.txt", file=sys.stderr)
+    raise SystemExit(2) from exc
 
 
 class S905XWorkerAgent:
@@ -155,13 +156,13 @@ class S905XWorkerAgent:
             self.state = "RUNNING"
             self.start_time = time.time()
             
-            # Start reader thread
+            # Start background stdout reader thread
             self.miner_stdout_thread = threading.Thread(target=self._read_miner_output, daemon=True)
             self.miner_stdout_thread.start()
-            return True, f"Miner started with {self.threads} hashing threads on core {self.control_core} control"
+            return True, f"Miner started on {self.threads} hashing cores (control core: {self.control_core})"
         except Exception as e:
             self.state = "ERROR"
-            return False, f"Failed to start miner: {e}"
+            return False, f"Failed to spawn miner process: {e}"
 
     def stop_miner(self):
         """Terminate the miner process cleanly"""
@@ -171,6 +172,7 @@ class S905XWorkerAgent:
                 self.miner_process.wait(timeout=2.0)
             except subprocess.TimeoutExpired:
                 self.miner_process.kill()
+        self.miner_process = None
         self.state = "STOPPED"
         self.hashrate_mhs = 0.0
         return True, "Miner stopped"
@@ -191,11 +193,12 @@ class S905XWorkerAgent:
             if not line:
                 continue
             
+            # Print to agent stdout for local debugging
             print(f"[Miner] {line}")
             
             # 1. Parse Hash Rate line: "Hash Rate: 8.95 MH/s" or "Total Hashrate: 9.87 MH/s"
             if "Hash Rate:" in line or "hashrate" in line.lower() or "MH/s" in line:
-                match = re.search(r'([0-9]+(?:\.[0-9]+)?)\s*MH/s', line, re.IGNORECASE)
+                match = re.search(r'([0-9]+(?:\\.[0-9]+)?)\\s*MH/s', line, re.IGNORECASE)
                 if match:
                     try:
                         self.hashrate_mhs = round(float(match.group(1)), 2)
@@ -242,47 +245,50 @@ class S905XWorkerAgent:
             self.state = "STOPPED"
             self.hashrate_mhs = 0.0
 
-    async def handle_command(self, ws, cmd):
-        """Execute command from server and return acknowledgement"""
-        cmd_id = cmd.get("cmdId", "unknown")
+    def _execute_command(self, cmd):
+        """Blocking command execution. Always invoked off the event loop
+        thread (asyncio.to_thread) so stop_miner()'s process wait and
+        restart_miner()'s settle delay can never stall telemetry."""
         action = cmd.get("action")
         params = cmd.get("params", {})
-        
-        status = "ok"
-        message = ""
-        
+
         if action == "start":
             ok, msg = self.start_miner()
-            status = "ok" if ok else "error"
-            message = msg
-        elif action == "stop":
+            return ("ok" if ok else "error"), msg
+        if action == "stop":
             ok, msg = self.stop_miner()
-            status = "ok" if ok else "error"
-            message = msg
-        elif action == "restart":
+            return ("ok" if ok else "error"), msg
+        if action == "restart":
             ok, msg = self.restart_miner()
-            status = "ok" if ok else "error"
-            message = msg
-        elif action == "set_threads":
+            return ("ok" if ok else "error"), msg
+        if action == "set_threads":
             new_threads = int(params.get("threads", 3))
             self.threads = max(1, min(self.max_cores, new_threads))
             if self.state == "RUNNING":
                 self.restart_miner()
-            message = f"Set threads to {self.threads}"
-        elif action == "set_pool":
-            pool_data = params.get("pool", {})
-            self.pool.update(pool_data)
+            return "ok", f"Configured {self.threads} hashing threads"
+        if action == "set_pool":
+            pool_data = params.get("pool", params)
+            self.pool.update({
+                "url": pool_data.get("url", self.pool["url"]),
+                "user": pool_data.get("user", self.pool["user"]),
+                "pass": pool_data.get("pass", self.pool["pass"])
+            })
             if self.state == "RUNNING":
                 self.restart_miner()
-            message = f"Updated pool to {self.pool.get('url')}"
-        elif action == "rename":
+            return "ok", f"Updated Stratum pool to {self.pool.get('url')}"
+        if action == "rename":
             self.worker_name = params.get("name", self.worker_name)
-            message = f"Renamed worker to {self.worker_name}"
-        elif action == "ping":
-            message = "pong"
-        else:
-            status = "error"
-            message = f"Unknown command '{action}'"
+            return "ok", f"Worker renamed to {self.worker_name}"
+        if action == "ping":
+            return "ok", "pong"
+        return "error", f"Unknown command '{action}'"
+
+    async def handle_command(self, ws, cmd):
+        """Execute command from server and return acknowledgement"""
+        cmd_id = cmd.get("cmdId", f"cmd-{int(time.time()*1000)}")
+
+        status, message = await asyncio.to_thread(self._execute_command, cmd)
 
         ack = {
             "type": "command_ack",
@@ -314,7 +320,7 @@ class S905XWorkerAgent:
                         "cores": self.max_cores,
                         "arch": "aarch64 Cortex-A53",
                         "hwCrypto": True,
-                        "agentVersion": "2.0.0"
+                        "agentVersion": "2.1.0"
                     }
                     await ws.send(json.dumps(auth_msg))
 
@@ -366,13 +372,16 @@ class S905XWorkerAgent:
 
 def main():
     parser = argparse.ArgumentParser(description="S905X Bitcoin Mining Worker Agent")
-    parser.add_argument("--server", default=os.getenv("CONTROLLER_WS_URL", "ws://192.168.1.156:3010/ws/worker"), help="Controller WebSocket URL")
+    parser.add_argument("--server", default=os.getenv("CONTROLLER_WS_URL", "ws://127.0.0.1:3010/ws/worker"), help="Controller WebSocket URL")
     parser.add_argument("--id", default=os.getenv("WORKER_ID", "s905x-real-01"), help="Unique Worker ID")
-    parser.add_argument("--token", default=os.getenv("AUTH_TOKEN", "s905x_secret_token"), help="Shared Auth Token")
+    parser.add_argument("--token", default=os.getenv("WORKER_AUTH_TOKEN") or os.getenv("AUTH_TOKEN"), help="Shared Auth Token (or set WORKER_AUTH_TOKEN env)")
     parser.add_argument("--name", default=os.getenv("WORKER_NAME", "Amlogic S905X Miner"), help="Friendly worker name")
     parser.add_argument("--miner", default=os.getenv("MINER_BIN", "bitcoin_sha256d_s905x"), help="Path to miner binary")
     parser.add_argument("--autostart", action="store_true", help="Automatically start mining upon launch")
     args = parser.parse_args()
+
+    if not args.token:
+        parser.error("--token is required (or set the WORKER_AUTH_TOKEN environment variable)")
 
     agent = S905XWorkerAgent(
         server_url=args.server,
@@ -399,22 +408,34 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 `;
 
 export const S905X_SYSTEMD_SERVICE = `[Unit]
-Description=S905X Bitcoin Miner Agent
+Description=S905X Bitcoin Mining Worker Agent Daemon
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/root
-ExecStart=/usr/bin/python3 /root/s905x_agent.py --server ws://192.168.1.156:3010/ws/worker --id s905x-real-01 --token s905x_secret_token --miner /root/bitcoin_sha256d_s905x
+WorkingDirectory=/opt/s905xMinerMess/s905x-miner
+# Runtime configuration lives in /etc/default/s905x-agent (provisioned by
+# scripts/install_service.sh). Required keys:
+#   WORKER_AUTH_TOKEN=<shared controller token>
+#   CONTROLLER_WS_URL=ws://<controller-host>:3010/ws/worker
+EnvironmentFile=/etc/default/s905x-agent
+ExecStart=/usr/bin/python3 /opt/s905xMinerMess/s905x-miner/agent/s905x_agent.py \\
+  --miner /opt/s905xMinerMess/s905x-miner/bitcoin_sha256d_s905x \\
+  --autostart
 Restart=always
 RestartSec=5
 KillMode=mixed
 TimeoutStopSec=10
+
+# Resource controls (optional)
+CPUSchedulingPolicy=other
+Nice=-5
 
 [Install]
 WantedBy=multi-user.target

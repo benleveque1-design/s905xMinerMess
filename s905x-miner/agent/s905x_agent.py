@@ -27,11 +27,12 @@ import re
 try:
     import asyncio
     import websockets
-except ImportError:
-    print("[Agent] Installing required dependency 'websockets' via pip...")
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "websockets"])
-    import websockets
-    import asyncio
+except ImportError as exc:
+    print("[Agent] FATAL: required dependency 'websockets' is not installed.", file=sys.stderr)
+    print("[Agent] Install it before starting the agent, e.g.:", file=sys.stderr)
+    print("[Agent]   sudo apt install python3-websockets", file=sys.stderr)
+    print("[Agent]   python3 -m pip install -r requirements.txt", file=sys.stderr)
+    raise SystemExit(2) from exc
 
 
 class S905XWorkerAgent:
@@ -244,34 +245,29 @@ class S905XWorkerAgent:
             self.state = "STOPPED"
             self.hashrate_mhs = 0.0
 
-    async def handle_command(self, ws, cmd):
-        """Execute command from server and return acknowledgement"""
-        cmd_id = cmd.get("cmdId", f"cmd-{int(time.time()*1000)}")
+    def _execute_command(self, cmd):
+        """Blocking command execution. Always invoked off the event loop
+        thread (asyncio.to_thread) so stop_miner()'s process wait and
+        restart_miner()'s settle delay can never stall telemetry."""
         action = cmd.get("action")
         params = cmd.get("params", {})
-        
-        status = "ok"
-        message = ""
-        
+
         if action == "start":
             ok, msg = self.start_miner()
-            status = "ok" if ok else "error"
-            message = msg
-        elif action == "stop":
+            return ("ok" if ok else "error"), msg
+        if action == "stop":
             ok, msg = self.stop_miner()
-            status = "ok" if ok else "error"
-            message = msg
-        elif action == "restart":
+            return ("ok" if ok else "error"), msg
+        if action == "restart":
             ok, msg = self.restart_miner()
-            status = "ok" if ok else "error"
-            message = msg
-        elif action == "set_threads":
+            return ("ok" if ok else "error"), msg
+        if action == "set_threads":
             new_threads = int(params.get("threads", 3))
             self.threads = max(1, min(self.max_cores, new_threads))
             if self.state == "RUNNING":
                 self.restart_miner()
-            message = f"Configured {self.threads} hashing threads"
-        elif action == "set_pool":
+            return "ok", f"Configured {self.threads} hashing threads"
+        if action == "set_pool":
             pool_data = params.get("pool", params)
             self.pool.update({
                 "url": pool_data.get("url", self.pool["url"]),
@@ -280,15 +276,19 @@ class S905XWorkerAgent:
             })
             if self.state == "RUNNING":
                 self.restart_miner()
-            message = f"Updated Stratum pool to {self.pool.get('url')}"
-        elif action == "rename":
+            return "ok", f"Updated Stratum pool to {self.pool.get('url')}"
+        if action == "rename":
             self.worker_name = params.get("name", self.worker_name)
-            message = f"Worker renamed to {self.worker_name}"
-        elif action == "ping":
-            message = "pong"
-        else:
-            status = "error"
-            message = f"Unknown command '{action}'"
+            return "ok", f"Worker renamed to {self.worker_name}"
+        if action == "ping":
+            return "ok", "pong"
+        return "error", f"Unknown command '{action}'"
+
+    async def handle_command(self, ws, cmd):
+        """Execute command from server and return acknowledgement"""
+        cmd_id = cmd.get("cmdId", f"cmd-{int(time.time()*1000)}")
+
+        status, message = await asyncio.to_thread(self._execute_command, cmd)
 
         ack = {
             "type": "command_ack",
@@ -320,7 +320,7 @@ class S905XWorkerAgent:
                         "cores": self.max_cores,
                         "arch": "aarch64 Cortex-A53",
                         "hwCrypto": True,
-                        "agentVersion": "2.0.0"
+                        "agentVersion": "2.1.0"
                     }
                     await ws.send(json.dumps(auth_msg))
 
@@ -372,13 +372,16 @@ class S905XWorkerAgent:
 
 def main():
     parser = argparse.ArgumentParser(description="S905X Bitcoin Mining Worker Agent")
-    parser.add_argument("--server", default=os.getenv("CONTROLLER_WS_URL", "ws://192.168.1.156:3010/ws/worker"), help="Controller WebSocket URL")
+    parser.add_argument("--server", default=os.getenv("CONTROLLER_WS_URL", "ws://127.0.0.1:3010/ws/worker"), help="Controller WebSocket URL")
     parser.add_argument("--id", default=os.getenv("WORKER_ID", "s905x-real-01"), help="Unique Worker ID")
-    parser.add_argument("--token", default=os.getenv("AUTH_TOKEN", "s905x_secret_token"), help="Shared Auth Token")
+    parser.add_argument("--token", default=os.getenv("WORKER_AUTH_TOKEN") or os.getenv("AUTH_TOKEN"), help="Shared Auth Token (or set WORKER_AUTH_TOKEN env)")
     parser.add_argument("--name", default=os.getenv("WORKER_NAME", "Amlogic S905X Miner"), help="Friendly worker name")
     parser.add_argument("--miner", default=os.getenv("MINER_BIN", "bitcoin_sha256d_s905x"), help="Path to miner binary")
     parser.add_argument("--autostart", action="store_true", help="Automatically start mining upon launch")
     args = parser.parse_args()
+
+    if not args.token:
+        parser.error("--token is required (or set the WORKER_AUTH_TOKEN environment variable)")
 
     agent = S905XWorkerAgent(
         server_url=args.server,

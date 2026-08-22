@@ -28,6 +28,14 @@ import {
 } from './types';
 import { DEFAULT_POOL } from './data/poolPresets';
 
+// Optional build-time token for the REST fallback path. When set at build
+// time (VITE_WORKER_AUTH_TOKEN), mutating REST calls carry x-auth-token.
+// Primary control traffic flows over the WebSocket connection.
+const env = (import.meta as any).env || {};
+const API_TOKEN: string | undefined = env.VITE_WORKER_AUTH_TOKEN;
+const authHeaders = (): Record<string, string> =>
+  API_TOKEN ? { 'x-auth-token': API_TOKEN } : {};
+
 export default function App() {
   const [workers, setWorkers] = useState<WorkerTelemetry[]>([]);
   const [poolConfig, setPoolConfig] = useState<PoolConfig>(DEFAULT_POOL);
@@ -142,7 +150,7 @@ export default function App() {
       // Fallback REST call
       fetch(`/api/workers/${workerId}/command`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: JSON.stringify(cmdPayload),
       }).catch((e) => console.error('REST command error:', e));
     }
@@ -173,7 +181,7 @@ export default function App() {
     setPoolConfig(newPool);
     fetch('/api/pool', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
       body: JSON.stringify(newPool),
     })
       .then((res) => res.json())
@@ -189,7 +197,7 @@ export default function App() {
   const handleSpawnSimulator = (name: string) => {
     fetch('/api/simulator/spawn', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
       body: JSON.stringify({ name }),
     })
       .then((res) => res.json())
@@ -201,7 +209,7 @@ export default function App() {
   const handleKillSimulator = (workerId: string) => {
     fetch('/api/simulator/kill', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
       body: JSON.stringify({ workerId }),
     })
       .then((res) => res.json())

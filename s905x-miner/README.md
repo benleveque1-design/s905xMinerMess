@@ -7,7 +7,7 @@ Self-contained ARMv8-A hardware-accelerated Bitcoin double SHA-256 (SHA-256d) mi
 ## ⚡ Key Technical Features
 
 1. **ARMv8 Cryptography Extensions (SIMD Hardware Acceleration)**:
-   - Uses native 32-bit vector intrinsics: `sha256h_u32`, `sha256h2_u32`, `sha256su0_u32`, and `sha256su1_u32`.
+   - Uses native 32-bit vector intrinsics: `vsha256hq_u32`, `vsha256h2q_u32`, `vsha256su0q_u32`, and `vsha256su1q_u32`.
    - Bypasses slow software 32-bit bit-rotation and Boolean function loops (`CH`, `MAJ`, `SIGMA0`, `SIGMA1`).
 2. **Midstate Precomputation**:
    - Pre-computes the first 64 bytes of the 80-byte Bitcoin block header (Version, PrevHash, MerkleRoot[0..27]) once per block template.
@@ -38,7 +38,7 @@ lscpu | grep -i crypto || cat /proc/cpuinfo | grep -i Features
 
 ### 2. Build the Native Binary
 ```bash
-cd /opt/s905x-miner
+cd /opt/s905xMinerMess/s905x-miner
 make
 # or run manually:
 gcc -O3 -march=armv8-a+crypto -pthread -Wall -Wextra -o bitcoin_sha256d_s905x bitcoin_sha256d_s905x.c
@@ -50,13 +50,13 @@ gcc -O3 -march=armv8-a+crypto -pthread -Wall -Wextra -o bitcoin_sha256d_s905x bi
 # or
 ./bitcoin_sha256d_s905x -t
 ```
-*Validates 100% bitwise parity against Block #0 (Genesis), Block #125552, Block #209999, and verifies midstate pre-calculation equivalence.*
+*Validates 100% bitwise parity against Block #0 (Genesis) and Block #125552, verifies midstate pre-calculation equivalence, checks Stratum `mining.subscribe` response parsing (extranonce1 extraction), and confirms extranonce1 propagates byte-exact into the coinbase path.*
 
 ### 4. Run Hashrate Benchmark
 ```bash
-./scripts/run_benchmark.sh 20000000 3 3
+./scripts/run_benchmark.sh 20000000 3
 # or
-./bitcoin_sha256d_s905x -b -n 20000000 -j 3 -c 3
+./bitcoin_sha256d_s905x -b -n 20000000 -j 3
 ```
 *Expected throughput on 4-core Cortex-A53 @ 1.512 GHz:* **~9.80 – 10.10 MH/s**.
 
@@ -67,8 +67,8 @@ gcc -O3 -march=armv8-a+crypto -pthread -Wall -Wextra -o bitcoin_sha256d_s905x bi
 ### Option A: Standalone Solo Stratum Mining (No Controller Needed)
 You can point the C binary directly to any Stratum V1 Bitcoin pool:
 ```bash
-./bitcoin_sha256d_s905x \
-  -s stratum+tcp://solo.ckpool.org:3333 \
+./bitcoin_sha256d_s905x --mine \
+  -P stratum+tcp://solo.ckpool.org:3333 \
   -u bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh.s905x-box \
   -p x \
   -j 3 \
@@ -79,18 +79,23 @@ You can point the C binary directly to any Stratum V1 Bitcoin pool:
 To connect this worker to your central Ubuntu Controller:
 ```bash
 python3 agent/s905x_agent.py \
-  --server ws://<CONTROLLER_IP>:3000/ws/worker \
+  --server ws://<CONTROLLER_IP>:3010/ws/worker \
   --id s905x-node-01 \
   --miner ./bitcoin_sha256d_s905x \
-  --token s905x_secret_token \
+  --token "$AUTH_TOKEN" \
   --autostart
 ```
+The token must match the controller's `WORKER_AUTH_TOKEN` (`--token`, or the
+`WORKER_AUTH_TOKEN` / legacy `AUTH_TOKEN` environment variable; it is
+mandatory). The controller endpoint defaults to `ws://127.0.0.1:3010/ws/worker`
+and can also be set via `CONTROLLER_WS_URL`.
 
 ### Option C: Running as a Background Systemd Service
-1. Edit `systemd/s905x-agent.service` with your controller's LAN IP.
-2. Install and activate:
+1. Export `WORKER_AUTH_TOKEN` (and optionally `CONTROLLER_WS_URL`) in your shell.
+2. Install and activate (provisions `/etc/default/s905x-agent`, checks that the
+   Python `websockets` dependency is present):
 ```bash
-sudo ./scripts/install_service.sh
+sudo -E ./scripts/install_service.sh
 ```
 3. Check status:
 ```bash
@@ -104,13 +109,19 @@ sudo journalctl -u s905x-agent -f
 
 | Flag | Long Argument | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `-t` | `--test` | — | Runs internal block test vectors and midstate equivalence verification. |
+| `-M` | `--mine` | — | Runs the live Stratum V1 Bitcoin miner. |
+| `-P` | `--pool <URL>` | — | Stratum pool URL (`stratum+tcp://host:port`). |
+| `-u`, `-U` | `--user <USER>` | — | Stratum worker username / Bitcoin payout address. |
+| `-p` | `--pass`, `--password` | `x` | Stratum worker password. |
+| `-j` | `--threads <N>` | `3` | Number of parallel hashing worker threads (pinned to cores 0..j-1). |
+| `-c` | `--control-core <N>` | `3` | Core index dedicated to Stratum networking and control plane (mining mode). |
+| `-o` | `--offset <N>` | `0` | First CPU core to pin hashing threads to. |
+|  | `--no-pin` | — | Disable CPU pinning entirely. |
+| `-t` | `--test` | — | Runs internal block test vectors, midstate equivalence, and parser regression suite. |
 | `-b` | `--benchmark` | — | Executes synthetic SHA-256d hashing loop and prints exact MH/s. |
-| `-n` | `--iterations` | `5000000` | Number of iterations per thread during benchmark. |
-| `-j` | `--threads` | `3` | Number of parallel hashing worker threads (pinned to cores 0..j-1). |
-| `-c` | `--control-core` | `3` | Core index dedicated to Stratum networking and control plane. |
-| `-s` | `--stratum` | — | Stratum pool URL (`stratum+tcp://host:port`). |
-| `-u` | `--user` | — | Stratum worker username / Bitcoin payout address. |
-| `-p` | `--pass` | `x` | Stratum worker password. |
-| `-f` | `--sw` | — | Force portable software C fallback (bypasses ARMv8 SIMD instructions). |
+| `-n` | `--iterations <N>` | `5000000` | Number of iterations per thread during benchmark. |
+| `-x` | `--spin-core <N>` | off | Diagnostic: run a busy-spin neighbor thread pinned to core N. |
+| `-y` | `--spin-duty <P>` | `100` | Duty cycle percent (0-100) for the spin thread. |
+| `-m` | `--spin-mode <M>` | `alu` | Spin workload type: alu, loadstore, membw, neon, sha. |
+| `-s` | `--sw-only` | — | Force portable software C fallback (bypasses ARMv8 SIMD instructions). |
 | `-h` | `--help` | — | Displays command-line help menu. |

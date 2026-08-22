@@ -549,6 +549,15 @@ static void reverse_bytes(uint8_t *dst, const uint8_t *src, size_t len) {
     }
 }
 
+/* Forward declarations: the correctness suite exercises these Section 8b
+ * helpers directly so regression tests always run the production code. */
+static int stratum_parse_subscribe(const char *resp_line,
+                                   char *extranonce1, size_t en1_cap,
+                                   int *extranonce2_size);
+static int stratum_build_coinbase(const char *coinb1_hex, const char *extranonce1_hex,
+                                  const char *extranonce2_hex, const char *coinb2_hex,
+                                  uint8_t *coinbase_hash);
+
 /* ============================================================================
  * SECTION 8: Correctness Tests
  * ============================================================================ */
@@ -709,6 +718,124 @@ static int run_correctness_tests(void) {
         }
     }
 #endif
+
+    /*
+     * Test 4: Regression - mining.subscribe response parsing.
+     *
+     * Pre-fix bug: the production parser located the first ']' after "result"
+     * and took the next quoted string, extracting the literal method name
+     * "mining.notify" instead of extranonce1. These vectors run the SAME
+     * production parser (stratum_parse_subscribe) used by the miner.
+     */
+    {
+        printf("Test 4: Stratum mining.subscribe response parsing\n");
+        int t4_failures = 0;
+        char en1[64];
+
+        struct {
+            const char *resp;
+            const char *want_en1;   /* NULL -> parse must be rejected */
+            int want_en2;           /* expected extranonce2_size on success */
+        } t4_vecs[] = {
+            /* canonical whitespace-formatted response (audit vector) */
+            {"{\"id\": 1, \"result\": [[[\"mining.set_difficulty\", \"ab\"], "
+             "[\"mining.notify\", \"cd\"]], \"01020304050607ff\", 4], \"error\": null}",
+             "01020304050607ff", 4},
+            /* canonical compact response (ckpool-style) */
+            {"{\"id\":1,\"result\":[[[\"mining.set_difficulty\",\"ab\"],[\"mining.notify\",\"cd\"]],\"01020304050607ff\",4],\"error\":null}",
+             "01020304050607ff", 4},
+            /* different valid EN1 / 8-byte extranonce2 size */
+            {"{\"id\":7,\"result\":[[[\"mining.set_difficulty\",\"k\"]],\"aabbccdd\",8],\"error\":null}",
+             "aabbccdd", 8},
+            /* malformed: no result member -> reject */
+            {"{\"id\":1,\"error\":null}", NULL, 0},
+            /* malformed: empty result array -> reject */
+            {"{\"id\":1,\"result\":[],\"error\":null}", NULL, 0},
+            /* regression shape: non-hex token where EN1 belongs -> reject */
+            {"{\"id\":1,\"result\":[[[\"mining.set_difficulty\",\"q\"]],\"mining.notify\",4],\"error\":null}",
+             NULL, 0},
+            /* non-canonical flat layout (EN1 not at result[1]) -> reject */
+            {"{\"id\":1,\"result\":[\"01020304050607ff\",4],\"error\":null}", NULL, 0},
+        };
+
+        for (size_t vi = 0; vi < sizeof(t4_vecs) / sizeof(t4_vecs[0]); vi++) {
+            memset(en1, 0, sizeof(en1));
+            int en2sz = 4;
+            int rc = stratum_parse_subscribe(t4_vecs[vi].resp, en1,
+                                             sizeof(en1), &en2sz);
+            int ok;
+            if (t4_vecs[vi].want_en1 == NULL)
+                ok = (rc != 0);
+            else
+                ok = (rc == 0 &&
+                      strcmp(en1, t4_vecs[vi].want_en1) == 0 &&
+                      en2sz == t4_vecs[vi].want_en2);
+
+            printf("  vector %zu: %s (rc=%d, en1=\"%s\", en2sz=%d)\n",
+                   vi + 1, ok ? "PASS" : "FAIL", rc,
+                   rc == 0 ? en1 : "(rejected)", en2sz);
+            if (!ok) t4_failures++;
+        }
+
+        if (t4_failures == 0) {
+            printf("  Status    : [PASS]\n\n");
+        } else {
+            printf("  Status    : [FAIL] (%d vector(s))\n\n", t4_failures);
+            failures += t4_failures;
+        }
+    }
+
+    /*
+     * Test 5: extranonce1 reaches the production coinbase path unchanged.
+     *
+     * stratum_build_coinbase() is invoked with the exact EN1 value that the
+     * fixed parser extracts and compared against an independent known-answer
+     * digest (sha256d over coinb1||EN1||en2||coinb2). Also verifies the old
+     * failure mode ("mining.notify", odd length) is rejected outright.
+     */
+    {
+        printf("Test 5: extranonce1 propagation into stratum_build_coinbase()\n");
+        int t5_failures = 0;
+
+        const char *cb1 = "aa55aa55aa55aa55aa55aa55aa55aa55aa55aa55aa55aa55aa55aa55aa55aa55aa55aa55aa55aa55";
+        const char *en2 = "00000001";
+        const char *cb2 = "bb66bb66bb66bb66bb66bb66bb66bb66bb66bb66bb66bb66bb66bb66bb66bb66bb66bb66bb66bb66";
+
+        struct {
+            const char *en1;
+            const char *want_hex;   /* NULL -> call must fail */
+        } t5_vecs[] = {
+            {"01020304050607ff", "248e4e50017edae5c063f6e02647265e167deeb8eff2975a6c7213044d2d5015"},
+            {"0102030405060700", "df54649ecdab02efe6a30cdca94e0ea1b2af9af751ebf98b8df6ab53dd9bab23"},
+            {"mining.notify", NULL},
+        };
+
+        for (size_t vi = 0; vi < sizeof(t5_vecs) / sizeof(t5_vecs[0]); vi++) {
+            uint8_t cb_hash[32];
+            char got_hex[65];
+            int rc = stratum_build_coinbase(cb1, t5_vecs[vi].en1, en2, cb2, cb_hash);
+            bytes_to_hex(cb_hash, 32, got_hex);
+
+            int ok;
+            if (t5_vecs[vi].want_hex == NULL)
+                ok = (rc != 0);
+            else
+                ok = (rc == 0 && strcmp(got_hex, t5_vecs[vi].want_hex) == 0);
+
+            printf("  vector %zu: %s (rc=%d%s%s)\n",
+                   vi + 1, ok ? "PASS" : "FAIL", rc,
+                   rc == 0 ? ", hash=" : "",
+                   rc == 0 ? got_hex : "");
+            if (!ok) t5_failures++;
+        }
+
+        if (t5_failures == 0) {
+            printf("  Status    : [PASS]\n\n");
+        } else {
+            printf("  Status    : [FAIL] (%d vector(s))\n\n", t5_failures);
+            failures += t5_failures;
+        }
+    }
 
     if (failures == 0) {
         printf("All correctness tests PASSED successfully!\n");
@@ -1032,6 +1159,95 @@ static int stratum_connect(const char *host, int port) {
 static const char *json_skip_whitespace(const char *p) {
     while (*p && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) p++;
     return p;
+}
+
+/*
+ * Parse extranonce1 and extranonce2_size out of a mining.subscribe response.
+ *
+ * De-facto Stratum V1 layout (Braiins spec; cf. ckpool generator.c
+ * parse_subscribe): result[0] = subscription details (an arbitrarily nested
+ * array of arrays), result[1] = "<extranonce1_hex>" string,
+ * result[2] = extranonce2_size integer:
+ *
+ *   "result": [ [["mining.set_difficulty",..],["mining.notify",..]],
+ *               "01020304050607ff", 4 ]
+ *
+ * The pre-fix implementation searched for the first ']' after "result" and
+ * grabbed the following quoted string, which yielded the literal method name
+ * "mining.notify" (13 chars, odd length -> stratum_build_coinbase parity
+ * failure -> zero jobs ever published) or the trailing "error" key instead.
+ * Here element [0] is skipped by tracking bracket depth from the start of the
+ * result array; string literals are consumed atomically (escape-aware) so
+ * quotes/brackets inside them cannot skew the depth count.
+ *
+ * Returns 0 on success: extranonce1 receives the NUL-terminated validated hex
+ * string and *extranonce2_size is updated when a sane value (1..8) follows.
+ * Returns -1 on any malformed response, leaving caller defaults untouched.
+ */
+static int stratum_parse_subscribe(const char *resp_line,
+                                   char *extranonce1, size_t en1_cap,
+                                   int *extranonce2_size) {
+    const char *res_pos = strstr(resp_line, "\"result\":");
+    if (!res_pos) res_pos = strstr(resp_line, "\"result\" :");
+    if (!res_pos) return -1;
+
+    const char *arr = strchr(res_pos, '[');
+    if (!arr) return -1;
+
+    /* Advance to result element [1]: stop at the first depth-1 comma that
+     * follows element [0]; bail out if the result array closes first. */
+    const char *p = arr;
+    int depth = 0;
+    int found_elem1 = 0;
+    while (*p) {
+        char c = *p;
+        if (c == '"') {
+            p++;
+            while (*p && *p != '"') {
+                if (*p == '\\' && p[1]) p++;
+                p++;
+            }
+            if (!*p) break;
+        } else if (c == '[' || c == '{') {
+            depth++;
+        } else if (c == ']' || c == '}') {
+            depth--;
+            if (depth <= 0) break;
+        } else if (c == ',' && depth == 1) {
+            found_elem1 = 1;
+            break;
+        }
+        p++;
+    }
+    if (!found_elem1) return -1;
+
+    /* Element [1] must be a non-empty hexadecimal string: extranonce1 */
+    const char *q1 = strchr(p, '"');
+    if (!q1) return -1;
+    q1++;
+    const char *q2 = strchr(q1, '"');
+    if (!q2 || q2 == q1) return -1;
+    size_t n = (size_t)(q2 - q1);
+    if (n >= en1_cap) return -1;
+    for (size_t i = 0; i < n; i++) {
+        char hc = q1[i];
+        int ok = ((hc >= '0' && hc <= '9') ||
+                  (hc >= 'a' && hc <= 'f') ||
+                  (hc >= 'A' && hc <= 'F'));
+        if (!ok) return -1;
+    }
+    memcpy(extranonce1, q1, n);
+    extranonce1[n] = '\0';
+
+    /* Element [2], if present, is the extranonce2 size in bytes (1..8) */
+    const char *comma = strchr(q2, ',');
+    if (comma) {
+        char *end = NULL;
+        long v = strtol(comma + 1, &end, 10);
+        if (end != comma + 1 && v >= 1 && v <= 8)
+            *extranonce2_size = (int)v;
+    }
+    return 0;
 }
 
 /* Stratum Worker Thread Argument */
@@ -1378,34 +1594,16 @@ static void *stratum_control_worker(void *arg) {
                     recv_len = remaining;
 
                     /* Parse extranonce1 and extranonce2_size from subscribe response */
-                    const char *res_pos = strstr(resp_line, "\"result\":");
-                    if (!res_pos) res_pos = strstr(resp_line, "\"result\" :");
-                    if (res_pos) {
-                        const char *arr = strchr(res_pos, '[');
-                        if (arr) {
-                            /* Find extranonce1 (hex string after first array) */
-                            const char *first_close = strchr(arr, ']');
-                            if (first_close) {
-                                const char *q1 = strchr(first_close, '\"');
-                                if (q1) {
-                                    q1++;
-                                    const char *q2 = strchr(q1, '\"');
-                                    if (q2) {
-                                        size_t en1_len = (size_t)(q2 - q1);
-                                        if (en1_len < sizeof(extranonce1)) {
-                                            memcpy(extranonce1, q1, en1_len);
-                                            extranonce1[en1_len] = '\0';
-                                        }
-                                        const char *comma = strchr(q2, ',');
-                                        if (comma) {
-                                            extranonce2_size = atoi(comma + 1);
-                                            if (extranonce2_size <= 0) extranonce2_size = 4;
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                    if (stratum_parse_subscribe(resp_line, extranonce1,
+                                                sizeof(extranonce1),
+                                                &extranonce2_size) == 0) {
+                        printf("Stratum: Subscribed (extranonce1=%s, extranonce2_size=%d)\n",
+                               extranonce1, extranonce2_size);
+                    } else {
+                        printf("Stratum: WARNING - malformed mining.subscribe response; "
+                               "keeping default extranonce values\n");
                     }
+                    fflush(stdout);
                     got_sub = 1;
                 }
             }
@@ -1791,8 +1989,7 @@ static void *spin_worker(void *arg) {
 }
 
 static void run_benchmark(uint64_t iterations, int num_threads, int core_offset, int pin_enabled,
-                           int spin_core, int spin_duty, spin_mode_t spin_mode,
-                           int control_core, int job_interval_ms, int reconnect_interval_ms, int share_zero_bits) {
+                           int spin_core, int spin_duty, spin_mode_t spin_mode) {
     if (num_threads < 1) num_threads = 1;
 
     long total_cores = detect_core_count();
@@ -1812,11 +2009,6 @@ static void run_benchmark(uint64_t iterations, int num_threads, int core_offset,
         printf("Busy Neighbor     : enabled (core %d, %d%% duty cycle, mode: %s)\n",
                spin_core, spin_duty, spin_mode_name(spin_mode));
     }
-    if (control_core >= 0) {
-        printf("Control-Plane Arch: enabled (control thread pinned to core %d, job every %dms, "
-               "reconnect every %dms, share target ~1-in-2^%d)\n",
-               control_core, job_interval_ms, reconnect_interval_ms, share_zero_bits);
-    }
     printf("Target Iterations : %lu hashes\n", (unsigned long)iterations);
 
     bench_thread_arg_t *args = calloc((size_t)num_threads, sizeof(bench_thread_arg_t));
@@ -1827,11 +2019,6 @@ static void run_benchmark(uint64_t iterations, int num_threads, int core_offset,
         free(threads);
         return;
     }
-
-    (void)control_core;
-    (void)job_interval_ms;
-    (void)reconnect_interval_ms;
-    (void)share_zero_bits;
 
     uint64_t base = iterations / (uint64_t)num_threads;
     uint64_t remainder = iterations % (uint64_t)num_threads;
@@ -1935,9 +2122,6 @@ static void print_usage(const char *prog_name) {
     printf("  -x, --spin-core <N>     Diagnostic: run a dummy busy-spin thread pinned to core N.\n");
     printf("  -y, --spin-duty <P>     Duty cycle percent (0-100) for the spin thread. Default: 100.\n");
     printf("  -m, --spin-mode <M>     Workload type for the spin thread: alu, loadstore, membw, neon, sha.\n");
-    printf("  -J, --job-interval <ms> Diagnostic: benchmark control thread job polling interval. Default: 250.\n");
-    printf("  -R, --reconnect <ms>    Diagnostic: benchmark control thread reconnect interval. Default: 5000.\n");
-    printf("  -z, --share-bits <N>    Diagnostic: benchmark synthetic share-target bits. Default: 24.\n");
     printf("  -s, --sw-only           Force the portable software backend (disable HW crypto).\n");
     printf("  -h, --help              Display this help message.\n");
 }
@@ -1961,9 +2145,6 @@ int main(int argc, char *argv[]) {
     int control_core = -1;
     int control_specified = 0;
     int spin_specified = 0;
-    int job_interval_ms = 250;
-    int reconnect_interval_ms = 5000;
-    int share_zero_bits = 24;
 
     if (argc < 2) {
         print_usage(argv[0]);
@@ -2096,39 +2277,6 @@ int main(int argc, char *argv[]) {
                 fprintf(stderr, "Error: Option %s requires an integer argument.\n", argv[i]);
                 return 1;
             }
-        } else if (strcmp(argv[i], "-J") == 0 || strcmp(argv[i], "--job-interval") == 0) {
-            if (i + 1 < argc) {
-                job_interval_ms = atoi(argv[++i]);
-                if (job_interval_ms < 1) {
-                    fprintf(stderr, "Error: --job-interval must be >= 1.\n");
-                    return 1;
-                }
-            } else {
-                fprintf(stderr, "Error: Option %s requires an integer argument.\n", argv[i]);
-                return 1;
-            }
-        } else if (strcmp(argv[i], "-R") == 0 || strcmp(argv[i], "--reconnect") == 0) {
-            if (i + 1 < argc) {
-                reconnect_interval_ms = atoi(argv[++i]);
-                if (reconnect_interval_ms < 0) {
-                    fprintf(stderr, "Error: --reconnect must be >= 0.\n");
-                    return 1;
-                }
-            } else {
-                fprintf(stderr, "Error: Option %s requires an integer argument.\n", argv[i]);
-                return 1;
-            }
-        } else if (strcmp(argv[i], "-z") == 0 || strcmp(argv[i], "--share-bits") == 0) {
-            if (i + 1 < argc) {
-                share_zero_bits = atoi(argv[++i]);
-                if (share_zero_bits < 0 || share_zero_bits > 32) {
-                    fprintf(stderr, "Error: --share-bits must be between 0 and 32.\n");
-                    return 1;
-                }
-            } else {
-                fprintf(stderr, "Error: Option %s requires an integer argument.\n", argv[i]);
-                return 1;
-            }
         } else {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             print_usage(argv[0]);
@@ -2197,8 +2345,7 @@ int main(int argc, char *argv[]) {
     }
 
     if (do_benchmark) {
-        run_benchmark(iterations, num_threads, core_offset, pin_enabled, spin_core, spin_duty, spin_mode,
-                      control_core, job_interval_ms, reconnect_interval_ms, share_zero_bits);
+        run_benchmark(iterations, num_threads, core_offset, pin_enabled, spin_core, spin_duty, spin_mode);
     }
 
     if (do_mine) {

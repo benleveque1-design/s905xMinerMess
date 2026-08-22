@@ -13,7 +13,6 @@ s905xMinerMess/
 ├── s905x-miner/                        # [PROJECT 1] S905X Worker Hashing Software (Runs on S905X TV Boxes)
 │   ├── bitcoin_sha256d_s905x.c         # Native ARMv8 SIMD SHA-256d C Mining Engine
 │   ├── Makefile                        # Compilation targets (all, crypto, generic, test, benchmark)
-│   ├── config.example.json             # Example local daemon configuration
 │   ├── agent/
 │   │   ├── s905x_agent.py              # Outbound WebSocket Python supervisor daemon
 │   │   └── requirements.txt            # Python dependencies (websockets)
@@ -75,7 +74,7 @@ s905xMinerMess/
 
 | Component | Status | Verification & Functional Detail |
 | :--- | :--- | :--- |
-| **`s905x-miner/bitcoin_sha256d_s905x.c`** | `IMPLEMENTED` | Native C code utilizing ARMv8 Crypto intrinsics (`sha256h_u32`, `sha256h2_u32`, `sha256su0_u32`, `sha256su1_u32`), midstate precomputation, and automatic **3 worker + 1 control core** allocation. *(Note: requires GCC/clang on an AArch64 host to compile)*. |
+| **`s905x-miner/bitcoin_sha256d_s905x.c`** | `IMPLEMENTED` | Native C code utilizing ARMv8 Crypto intrinsics (`vsha256hq_u32`, `vsha256h2q_u32`, `vsha256su0q_u32`, `vsha256su1q_u32`), midstate precomputation, and automatic **3 worker + 1 control core** allocation. *(Note: requires GCC/clang on an AArch64 host to compile)*. |
 | **`s905x-miner/agent/s905x_agent.py`** | `IMPLEMENTED` | Standalone Python 3 supervisor daemon connecting outbound to `/ws/worker`, parsing stdout for MH/s, reading `/sys/class/thermal`, and dispatching restart/thread/pool commands. |
 | **Central Controller (`webapp/server.ts`)** | `IMPLEMENTED & VERIFIED` | Node.js Express server + WebSocket daemon handling client browser connections (`/ws/client`) and worker connections (`/ws/worker`) on configurable `PORT` (default `3010`). Tested and compiles cleanly. |
 | **Web Dashboard (`webapp/src/`)** | `IMPLEMENTED & VERIFIED` | Full React + Tailwind CSS dashboard with live node metrics, per-worker and fleet-wide controls, thread sliders, and pool broadcast tools. Verified with `npm run build` and `tsc`. |
@@ -110,24 +109,28 @@ make
 ./scripts/run_tests.sh
 
 # Run 3+1 core benchmark (Target: ~9.80 - 10.10 MH/s on Cortex-A53 @ 1.512 GHz)
-./scripts/run_benchmark.sh 20000000 3 3
+./scripts/run_benchmark.sh 20000000 3
 ```
 
 #### 4. Configure & Start the Outbound Worker Agent
-Edit `systemd/s905x-agent.service` with your Ubuntu server IP:
-```ini
-ExecStart=/usr/bin/python3 /opt/s905xMinerMess/s905x-miner/agent/s905x_agent.py \
-  --server ws://192.168.1.100:3010/ws/worker \
-  --id s905x-node-01 \
-  --miner /opt/s905xMinerMess/s905x-miner/bitcoin_sha256d_s905x \
-  --token s905x_secret_token \
-  --autostart
-```
 
-Install and enable the background systemd daemon:
+The agent reads its configuration from the environment (no secrets in unit files):
+
+| Variable | Meaning | Default |
+| :--- | :--- | :--- |
+| `WORKER_AUTH_TOKEN` | Shared token; must match the controller's value | *required* |
+| `CONTROLLER_WS_URL` | Controller WebSocket endpoint | `ws://127.0.0.1:3010/ws/worker` |
+
+Install and enable the background systemd daemon (the installer provisions
+`/etc/default/s905x-agent` from these variables and verifies dependencies):
 ```bash
-sudo ./scripts/install_service.sh
+export WORKER_AUTH_TOKEN="<same token as the controller>"
+export CONTROLLER_WS_URL="ws://<controller-ip>:3010/ws/worker"
+sudo -E ./scripts/install_service.sh
 ```
+The agent additionally requires the Python `websockets` package
+(`sudo apt install python3-websockets`); it refuses to start without it rather
+than installing packages at runtime.
 
 ---
 
@@ -153,13 +156,19 @@ npm install
 #### 3. Configure Environment Variables
 ```bash
 cp .env.example .env
+# Generate a strong shared token, then put it in .env:
+echo "WORKER_AUTH_TOKEN=$(openssl rand -hex 32)" >> .env
 ```
 Default configuration values:
 ```env
 PORT=3010
 NODE_ENV=production
-WORKER_AUTH_TOKEN=s905x_secret_token
+WORKER_AUTH_TOKEN=<your-generated-token>
 ```
+The controller refuses to start when `WORKER_AUTH_TOKEN` is unset. All
+mutating REST endpoints (`POST /api/workers/:id/command`, `POST /api/pool`,
+`POST /api/simulator/*`) require an `x-auth-token: <WORKER_AUTH_TOKEN>` header;
+read-only GET endpoints stay open for monitoring.
 
 #### 4. Build Production Bundle
 ```bash
@@ -211,12 +220,12 @@ Communication occurs over JSON WebSocket messages on `/ws/worker`:
 {
   "type": "auth",
   "workerId": "s905x-node-01",
-  "token": "s905x_secret_token",
+  "token": "<WORKER_AUTH_TOKEN>",
   "name": "Living Room S905X",
   "cores": 4,
   "arch": "aarch64 Cortex-A53",
   "hwCrypto": true,
-  "agentVersion": "2.0.0"
+  "agentVersion": "2.1.0"
 }
 ```
 
@@ -257,7 +266,7 @@ Communication occurs over JSON WebSocket messages on `/ws/worker`:
 
 ## 🎯 Verification Checklist
 
-1. **Standalone C Miner Tests**: Run `./s905x-miner/scripts/run_tests.sh` on the S905X. Confirm all 4 tests pass.
+1. **Standalone C Miner Tests**: Run `./s905x-miner/scripts/run_tests.sh` on the S905X. Confirm the full suite passes (block header KATs, Stratum subscribe parsing, extranonce1 propagation).
 2. **Benchmark Verification**: Run `./s905x-miner/scripts/run_benchmark.sh` on the S905X. Confirm hashrate is ~9.87 MH/s across 3 hashing threads.
 3. **Web Dashboard Build**: Run `npm run build` on the Ubuntu controller. Confirm zero TypeScript or bundling errors.
 4. **Live Worker Appearance**: Open `http://<CONTROLLER_IP>:3010` in your browser. Verify the physical S905X appears with its real IP, temperature, frequency, and `ARMv8 Crypto: Enabled`.

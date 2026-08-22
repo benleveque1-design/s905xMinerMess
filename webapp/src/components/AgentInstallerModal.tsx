@@ -102,7 +102,7 @@ gcc -O3 -march=armv8-a+crypto -pthread -o bitcoin_sha256d_s905x bitcoin_sha256d_
               <div className="flex items-center justify-between">
                 <span className="font-semibold text-white">2. Launch Worker Agent Daemon</span>
                 <button
-                  onClick={() => handleCopy('python3 s905x_agent.py --server ws://<CONTROLLER_IP>:3010/ws/worker --id s905x-01 --token s905x_secret_token', 'step2')}
+                  onClick={() => handleCopy('python3 s905x_agent.py --server ws://<CONTROLLER_IP>:3010/ws/worker --id s905x-01 --token "$WORKER_AUTH_TOKEN"', 'step2')}
                   className="flex items-center gap-1 text-[11px] text-zinc-400 hover:text-white"
                 >
                   {copiedSection === 'step2' ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
@@ -110,10 +110,11 @@ gcc -O3 -march=armv8-a+crypto -pthread -o bitcoin_sha256d_s905x bitcoin_sha256d_
                 </button>
               </div>
               <pre className="bg-zinc-900 p-2.5 rounded text-emerald-300 font-mono text-[11px] overflow-x-auto">
-python3 s905x_agent.py --server ws://&lt;CONTROLLER_IP&gt;:3010/ws/worker --id s905x-01 --token s905x_secret_token
+python3 s905x_agent.py --server ws://&lt;CONTROLLER_IP&gt;:3010/ws/worker --id s905x-01 --token "$WORKER_AUTH_TOKEN"
               </pre>
               <p className="text-[11px] text-zinc-400">
-                Replace <code className="text-orange-300">&lt;CONTROLLER_IP&gt;</code> with your controller/ESP32 IP address.
+                Replace <code className="text-orange-300">&lt;CONTROLLER_IP&gt;</code> with your controller IP address and
+                set <code className="text-orange-300">WORKER_AUTH_TOKEN</code> to the same token the controller runs with.
               </p>
             </div>
 
