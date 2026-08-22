@@ -18,9 +18,6 @@ import {
   AgentInstallerModal 
 } from './components/AgentInstallerModal';
 import { 
-  Esp32GuideModal 
-} from './components/Esp32GuideModal';
-import { 
   WorkerTelemetry, 
   PoolConfig, 
   FleetStats, 
@@ -28,9 +25,9 @@ import {
 } from './types';
 import { DEFAULT_POOL } from './data/poolPresets';
 
-// Optional build-time token for the REST fallback path. When set at build
-// time (VITE_WORKER_AUTH_TOKEN), mutating REST calls carry x-auth-token.
-// Primary control traffic flows over the WebSocket connection.
+// Worker auth token is intentionally NOT baked into static builds. All worker
+// control traffic (commands, pool updates) flows over the authenticated
+// dashboard WebSocket; mutating REST endpoints remain controller-side only.
 const env = (import.meta as any).env || {};
 const API_TOKEN: string | undefined = env.VITE_WORKER_AUTH_TOKEN;
 const authHeaders = (): Record<string, string> =>
@@ -46,7 +43,6 @@ export default function App() {
   const [isPoolModalOpen, setIsPoolModalOpen] = useState(false);
   const [isSimulatorModalOpen, setIsSimulatorModalOpen] = useState(false);
   const [isAgentModalOpen, setIsAgentModalOpen] = useState(false);
-  const [isEsp32ModalOpen, setIsEsp32ModalOpen] = useState(false);
 
   // Toast feedback
   const [toastMessage, setToastMessage] = useState<{ text: string; type: 'success' | 'info' | 'error' } | null>(null);
@@ -134,7 +130,9 @@ export default function App() {
     };
   }, []);
 
-  // Send Command to Worker(s)
+  // Send Command to Worker(s).
+  // Commands only travel over the dashboard WebSocket: mutating REST endpoints
+  // require x-auth-token, which is deliberately NOT baked into static builds.
   const sendCommand = (workerId: string, action: string, params: any = {}) => {
     const cmdPayload = {
       type: 'command',
@@ -144,16 +142,25 @@ export default function App() {
       params,
     };
 
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify(cmdPayload));
-    } else {
-      // Fallback REST call
-      fetch(`/api/workers/${workerId}/command`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...authHeaders() },
-        body: JSON.stringify(cmdPayload),
-      }).catch((e) => console.error('REST command error:', e));
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(cmdPayload));
+      return;
     }
+
+    // Socket not open yet (initial connect or reconnect window): poll briefly
+    // for it to open instead of failing over to an unauthenticated REST call.
+    const startedAt = Date.now();
+    const waiter = setInterval(() => {
+      const cur = wsRef.current;
+      if (cur && cur.readyState === WebSocket.OPEN) {
+        clearInterval(waiter);
+        cur.send(JSON.stringify(cmdPayload));
+      } else if (Date.now() - startedAt > 5000) {
+        clearInterval(waiter);
+        showToast(`Failed to send "${action}" command: dashboard not connected`, 'error');
+      }
+    }, 250);
   };
 
   const handleStartWorker = (id: string) => sendCommand(id, 'start');
@@ -179,18 +186,10 @@ export default function App() {
 
   const handleSaveAndBroadcastPool = (newPool: PoolConfig) => {
     setPoolConfig(newPool);
-    fetch('/api/pool', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...authHeaders() },
-      body: JSON.stringify(newPool),
-    })
-      .then((res) => res.json())
-      .then(() => {
-        showToast(`Stratum pool broadcasted to all workers: ${newPool.url}`, 'success');
-      })
-      .catch((err) => {
-        showToast(`Failed to broadcast pool: ${err}`, 'error');
-      });
+    // Routed through the dashboard WebSocket (no baked auth token needed);
+    // per-worker acks arrive via command_ack and confirm the broadcast.
+    sendCommand('all', 'set_pool', { pool: newPool });
+    showToast(`Stratum pool broadcast queued: ${newPool.url}`, 'info');
   };
 
   // Simulator actions
@@ -267,7 +266,6 @@ export default function App() {
         onOpenPoolConfig={() => setIsPoolModalOpen(true)}
         onOpenSimulator={() => setIsSimulatorModalOpen(true)}
         onOpenAgentSetup={() => setIsAgentModalOpen(true)}
-        onOpenEsp32Guide={() => setIsEsp32ModalOpen(true)}
       />
 
       {/* Main Content Area */}
@@ -327,10 +325,6 @@ export default function App() {
 
       {isAgentModalOpen && (
         <AgentInstallerModal onClose={() => setIsAgentModalOpen(false)} />
-      )}
-
-      {isEsp32ModalOpen && (
-        <Esp32GuideModal onClose={() => setIsEsp32ModalOpen(false)} />
       )}
     </div>
   );

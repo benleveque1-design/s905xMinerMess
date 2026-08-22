@@ -1,6 +1,6 @@
 {
   "name": "S905X Bitcoin Mining Controller",
-  "description": "Central dashboard and controller for monitoring, commanding, and telemetry aggregation of multiple Amlogic S905X Bitcoin SHA-256d mining nodes with ESP32-compatible WebSocket protocol.",
+  "description": "Central dashboard and controller for monitoring, commanding, and telemetry aggregation of multiple Amlogic S905X Bitcoin SHA-256d mining nodes over a WebSocket protocol.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

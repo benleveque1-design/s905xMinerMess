@@ -357,6 +357,12 @@ async function startServer() {
         try {
           const data = JSON.parse(raw.toString());
           if (data.type === "command") {
+            // Keep controller-side pool state in sync when pools are set via the
+            // dashboard WebSocket (same semantics as POST /api/pool).
+            if (data.action === "set_pool" && data.params?.pool) {
+              globalPool = { ...globalPool, ...data.params.pool };
+              broadcastToClients({ type: "pool_update", pool: globalPool });
+            }
             const success = sendWorkerCommand(data.workerId, data);
             if (!success) {
               ws.send(JSON.stringify({
@@ -447,7 +453,9 @@ async function startServer() {
             if (w) {
               const now = Date.now();
               w.state = data.state || 'RUNNING';
+              w.name = data.name || w.name;
               w.threads = data.threads || w.threads;
+              w.pool = data.pool || w.pool;
               w.hashrateMhs = data.hashrateMhs ?? 0.0;
               w.tempC = data.tempC ?? w.tempC;
               w.cpuFreqMhz = data.cpuFreqMhz ?? w.cpuFreqMhz;
@@ -506,7 +514,7 @@ async function startServer() {
     }
   });
 
-  // REST API Endpoints (Lightweight & ESP32 Compatible)
+  // REST API Endpoints
   app.get("/api/health", (req, res) => {
     res.json({
       status: "ok",

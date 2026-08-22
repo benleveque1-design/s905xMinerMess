@@ -11,7 +11,6 @@ import {
   Settings2, 
   PlusCircle, 
   Download, 
-  Microchip,
   Activity,
   Zap
 } from 'lucide-react';
@@ -27,7 +26,6 @@ interface HeaderProps {
   onOpenPoolConfig: () => void;
   onOpenSimulator: () => void;
   onOpenAgentSetup: () => void;
-  onOpenEsp32Guide: () => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -40,7 +38,6 @@ export const Header: React.FC<HeaderProps> = ({
   onOpenPoolConfig,
   onOpenSimulator,
   onOpenAgentSetup,
-  onOpenEsp32Guide,
 }) => {
   const getTempColor = (t: number) => {
     if (t <= 0) return 'text-zinc-400';
@@ -112,15 +109,6 @@ export const Header: React.FC<HeaderProps> = ({
           >
             <Download className="w-3.5 h-3.5 text-emerald-400" />
             S905X Agent
-          </button>
-
-          <button
-            id="btn-esp32-guide"
-            onClick={onOpenEsp32Guide}
-            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md bg-zinc-800 hover:bg-zinc-700 text-zinc-200 border border-zinc-700 transition"
-          >
-            <Microchip className="w-3.5 h-3.5 text-purple-400" />
-            ESP32 Port
           </button>
         </div>
       </div>
