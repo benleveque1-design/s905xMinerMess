@@ -76,7 +76,9 @@ Two self-contained projects sharing one repo — no shared code between them:
 - Agent journal appears empty because python stdout is block-buffered under systemd; add `PYTHONUNBUFFERED=1` to the unit if logs are wanted (root change). `systemctl restart s905x-agent` needs root on the box; crashes auto-respawn via `Restart=always`.
 - Server ufw is `ENABLED=no` (not enforcing) → no firewall change needed for LAN access. Server LAN IP is DHCP (`192.168.1.156`) — if it changes, update `CONTROLLER_WS_URL` in `/etc/default/s905x-agent`; pin it via router reservation only with owner approval.
 
-## Minimal-stack investigation (2026-08-22; details in docs/s905x-minimal-stack.md)
+## Minimal-stack investigation (2026-08-22; details in docs/s905x-minimal-stack.md, live stripping in docs/s905x-strip-experiment-2026-08-22.md)
+
+- Live stripping ran on `s905x2` (second box, benabus2, passwordless sudo, 192.168.1.246) and is **COMPLETE (2026-08-22)**: A1 services + A2 timers + pulseaudio autospawn kill + A3 swap-off (ramlog kept) + A4 purge (1375→733 pkgs) + B1 initramfs removal — all reboot-verified. Final: boot **19.8→12.2 s**, running units 44→25, idle RAM **324→~210 MiB**, no swap, idle CPU 0.3%. Rollback snapshots on-box `~/strip-rollback/` + repo `docs/artifacts/strip-s905x2/` (incl. pre/post extlinux.conf; uInitrd file left in place for one-line B1 revert). Gotchas recorded there: `root=LABEL=` does NOT work without initrd (switched to PARTUUID); miner CLI rejects glued short options (`-j3` → use `-j 3`); python3-websockets was never installed on s905x2 until now. NTP is LAN-blocked on BOTH boxes (pre-existing; chrony Reach 0) — boxes run fake-hwclock time.
 
 - Baseline on the box: synthetic `-b -n 200000000` = 9.96–10.02 MH/s at `-j3`, single-core 3.344 MH/s, scaling ratio 2.985 ⇒ hash threads already run free of userspace interference; don't expect hashrate gains from stripping userspace/kernel — the wins there are RAM/boot-time only.
 - Miner's complete kernel-facing surface is tiny (`nm -D` census in docs): pthreads/affinity, timers, TCP, sysfs reads of `thermal_zone0/temp` + `scaling_cur_freq`. Everything else in Armbian is convenience.

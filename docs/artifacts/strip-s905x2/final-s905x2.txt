@@ -1,0 +1,179 @@
+===IDENT===
+Armbian_community 26.8.0-trunk.170 resolute
+Linux aml-s9xx-box 6.18.35-current-meson64 #2 SMP PREEMPT Tue Jun  9 10:28:53 UTC 2026 aarch64 GNU/Linux
+ 00:45:27 up 0 min,  1 user,  load average: 1.13, 0.33, 0.11
+===BOOTTIME===
+Startup finished in 3.420s (kernel) + 8.779s (userspace) = 12.200s 
+multi-user.target reached after 8.773s in userspace.
+2.690s dev-mmcblk1p2.device
+1.541s systemd-resolved.service
+1.500s NetworkManager.service
+1.460s systemd-random-seed.service
+1.276s systemd-udev-trigger.service
+1.093s armbian-ramlog.service
+ 624ms armbian-zram-config.service
+ 607ms user@1000.service
+ 585ms chrony.service
+ 556ms systemd-logind.service
+ 428ms keyboard-setup.service
+ 368ms dev-zram0.device
+ 368ms e2scrub_reap.service
+ 365ms netplan-configure.service
+ 328ms armbian-led-state.service
+ 323ms systemd-udevd.service
+ 303ms alsa-restore.service
+ 300ms systemd-hostnamed.service
+ 295ms dbus.service
+ 287ms dev-hugepages.mount
+ 282ms dev-mqueue.mount
+ 279ms sys-kernel-debug.mount
+ 276ms sys-kernel-tracing.mount
+ 237ms kmod-static-nodes.service
+ 218ms sys-kernel-config.mount
+===CRITCHAIN===
+The time when unit became active or started is printed after the "@" character.
+The time the unit took to start is printed after the "+" character.
+
+multi-user.target @8.773s
+└─getty.target @8.769s
+  └─getty@tty1.service @8.764s
+    └─system-getty.slice @8.754s
+      └─setvtrgb.service @8.656s +75ms
+        └─systemd-user-sessions.service @8.552s +66ms
+          └─network.target @8.502s
+            └─NetworkManager.service @6.991s +1.500s
+              └─dbus.service @6.650s +295ms
+                └─basic.target @6.571s
+                  └─armbian-hardware-optimize.service @6.442s +125ms
+                    └─sysinit.target @6.390s
+                      └─systemd-tmpfiles-setup.service @6.281s +101ms
+                        └─systemd-journal-flush.service @6.190s +53ms
+                          └─systemd-journald.service @5.975s +206ms
+                            └─armbian-ramlog.service @4.871s +1.093s
+                              └─var-log.mount @5.091s
+                                └─dev-zram0.device @5.088s +368ms
+===ENABLED-UNITS===
+armbian-hardware-monitor.service   enabled enabled
+armbian-hardware-optimize.service  enabled enabled
+armbian-led-state.service          enabled enabled
+armbian-ramlog.service             enabled enabled
+armbian-zram-config.service        enabled enabled
+chrony.service                     enabled enabled
+console-setup.service              enabled enabled
+cron.service                       enabled enabled
+dmesg.service                      enabled enabled
+e2scrub_reap.service               enabled enabled
+fake-hwclock-load.service          enabled enabled
+fake-hwclock-save.service          enabled enabled
+fake-hwclock-save.timer            enabled enabled
+fstrim.timer                       enabled enabled
+getty@.service                     enabled enabled
+keyboard-setup.service             enabled enabled
+logrotate.timer                    enabled enabled
+netplan-configure.service          enabled enabled
+NetworkManager-dispatcher.service  enabled enabled
+NetworkManager.service             enabled enabled
+NetworkManager-wait-online.service enabled enabled
+remote-fs.target                   enabled enabled
+setvtrgb.service                   enabled enabled
+sshd-keygen.service                enabled enabled
+ssh.socket                         enabled enabled
+systemd-pstore.service             enabled enabled
+systemd-resolved-monitor.socket    enabled enabled
+systemd-resolved.service           enabled enabled
+systemd-resolved-varlink.socket    enabled enabled
+===ENABLED-TIMERS===
+fake-hwclock-save.service
+fstrim.service
+logrotate.service
+systemd-tmpfiles-clean.service
+===RUNNING===
+25
+144
+141
+===MEM===
+               total        used        free      shared  buff/cache   available
+Mem:             914         202         596           4         189         711
+Swap:              0           0           0
+NAME       ALGORITHM DISKSIZE  DATA  COMPR TOTAL STREAMS MOUNTPOINT
+/dev/zram0 zstd           50M  4.2M 996.1K  2.2M         /var/log
+===TOPMEM===
+  RSS COMMAND
+30420 NetworkManager
+15756 systemd
+15596 systemd-resolve
+14252 systemd
+12640 chronyd
+12268 sshd-session
+11812 systemd-udevd
+ 8836 systemd-journal
+ 8456 systemd-logind
+ 8264 sshd-session
+ 7436 sshd
+ 6392 head
+ 4884 ps
+ 4588 dbus-daemon
+ 3944 dbus-daemon
+ 3776 (sd-pam)
+ 3540 chronyd
+ 3472 bash
+ 3340 mpris-proxy
+===DISK===
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/root       5.7G  2.6G  3.2G  46% /
+/dev/mmcblk1p1  488M  107M  381M  22% /boot
+NAME          SIZE TYPE FSTYPE MOUNTPOINT
+mmcblk1       7.3G disk        
+├─mmcblk1p1   488M part vfat   /boot
+└─mmcblk1p2   5.9G part ext4   /
+mmcblk1boot0    4M disk        
+mmcblk1boot1    4M disk        
+zram0          50M disk ext4   /var/log
+zram1           0B disk        
+zram2           0B disk        
+===DU===
+2.2G	/usr
+353M	/var
+4.0K	/opt
+===PKGS===
+733
+2214.09 MiB installed-size
+===DESKTOP?===
+===IDLE-CPU-30S===
+busy% over 30s: 99
+ 400 ps
+ 100 head
+14.2 systemd
+ 1.9 systemd-resolve
+ 1.8 dbus-daemon
+ 1.6 systemd-udevd
+ 1.2 systemd
+ 0.6 systemd-journal
+===THERMAL-FREQ===
+43000
+1512000
+ondemand
+===GUARDRAIL===
+none
+===MINER-STATE===
+not-found
+inactive
+===KERNELCFG===
+CONFIG_BLK_DEV_INITRD=y
+CONFIG_DEVTMPFS_MOUNT=y
+CONFIG_MMC_MESON_GX=y
+CONFIG_EXT4_FS=y
+CONFIG_BLK_DEV_INITRD=y
+CONFIG_DEVTMPFS_MOUNT=y
+CONFIG_MMC_MESON_GX=y
+CONFIG_EXT4_FS=y
+===EXTLINUX===
+label Armbian_community
+  kernel /Image
+  # initrd /uInitrd  # B1: removed (kernel has MMC_MESON_GX=y EXT4_FS=y DEVTMPFS_MOUNT=y)
+  fdt /dtb/amlogic/meson-gxl-s905x-p212.dtb
+  append root=PARTUUID=937d0000-02 rootflags=data=writeback console=ttyAML0,115200n8 console=tty0 rw no_console_suspend consoleblank=0 fsck.fix=yes fsck.repair=yes net.ifnames=0
+===INITRD-SIZE===
+41M /boot/Image
+25M /boot/initrd.img-6.18.35-current-meson64
+25M /boot/uInitrd

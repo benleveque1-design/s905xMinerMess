@@ -80,6 +80,14 @@ diff verification) is ready but **needs sudo** — owner action required. Expect
 outcome based on scaling evidence above: ≈0 hashrate delta; gains would be RAM/boot
 only.
 
+**LIVE VERIFICATION (2026-08-22, on `s905x2`, full strip — details and rollback in
+`s905x-strip-experiment-2026-08-22.md`):** desktop/print/scan/avahi stack purged,
+timers trimmed, swap off, initramfs removed from boot. Measured: boot **21.3 s →
+12.2 s**, running units 44 → 25, idle RAM ~492 MB-equivalent → ~205 MiB, idle CPU
+0.3 %, rootfs 62 % → 46 %. Full `-t` suite passes and dead-port sandbox mining works
+on the stripped userspace. Prediction confirmed: removable blame was real (~150 MB
+RSS class, ~8–9 s boot) but is boot/RAM-only — no hashrate effect expected or claimed.
+
 ## 5. Kernel reduction (built locally, boot untested — no spare node)
 
 Stock config: 6 873 enabled symbols, PREEMPT=y, HZ=250, DEBUG_INFO+BTF,
