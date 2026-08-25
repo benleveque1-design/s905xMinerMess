@@ -222,10 +222,10 @@ export default function App() {
   const totalHashrateMhs = activeWorkers.reduce((sum, w) => sum + (w.hashrateMhs || 0), 0);
   const totalSharesAccepted = workers.reduce((sum, w) => sum + (w.sharesAccepted || 0), 0);
   const totalSharesRejected = workers.reduce((sum, w) => sum + (w.sharesRejected || 0), 0);
-  const onlineWorkersWithTemp = workers.filter((w) => w.state !== 'OFFLINE' && w.tempC > 0);
+  const onlineWorkersWithTemp = workers.filter((w) => w.state !== 'OFFLINE' && typeof w.tempC === 'number' && w.tempC > 0);
   const avgTemperatureC =
     onlineWorkersWithTemp.length > 0
-      ? onlineWorkersWithTemp.reduce((sum, w) => sum + w.tempC, 0) / onlineWorkersWithTemp.length
+      ? onlineWorkersWithTemp.reduce((sum, w) => sum + (w.tempC as number), 0) / onlineWorkersWithTemp.length
       : 0;
 
   const fleetStats: FleetStats = {

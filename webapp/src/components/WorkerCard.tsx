@@ -211,9 +211,9 @@ export const WorkerCard: React.FC<WorkerCardProps> = ({
           <div className="bg-zinc-950/60 border border-zinc-800/80 rounded-lg p-2 flex items-center gap-2">
             <Thermometer className="w-4 h-4 text-amber-400 shrink-0" />
             <div>
-              <div className="text-[10px] text-zinc-400">S905X Temp</div>
-              <div className={`font-mono font-semibold ${getTempColor(worker.tempC)}`}>
-                {worker.tempC > 0 ? `${worker.tempC.toFixed(1)} °C` : '--'}
+              <div className="text-[10px] text-zinc-400">Temp</div>
+              <div className={`font-mono font-semibold ${worker.tempC != null ? getTempColor(worker.tempC) : ''}`}>
+                {worker.tempC != null && worker.tempC > 0 ? `${worker.tempC.toFixed(1)} °C` : 'N/A'}
               </div>
             </div>
           </div>

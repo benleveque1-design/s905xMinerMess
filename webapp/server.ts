@@ -31,7 +31,7 @@ interface WorkerRecord {
   threads: number;
   maxCores: number;
   hashrateMhs: number;
-  tempC: number;
+  tempC: number | null;
   cpuFreqMhz: number;
   sharesFound: number;
   sharesAccepted: number;
@@ -420,7 +420,7 @@ async function startServer() {
               threads: data.threads || 4,
               maxCores: data.cores || 4,
               hashrateMhs: 0.0,
-              tempC: 45.0,
+              tempC: null,
               cpuFreqMhz: 1512,
               sharesFound: 0,
               sharesAccepted: 0,
@@ -457,7 +457,7 @@ async function startServer() {
               w.threads = data.threads || w.threads;
               w.pool = data.pool || w.pool;
               w.hashrateMhs = data.hashrateMhs ?? 0.0;
-              w.tempC = data.tempC ?? w.tempC;
+              if (data.tempC !== undefined) w.tempC = data.tempC;
               w.cpuFreqMhz = data.cpuFreqMhz ?? w.cpuFreqMhz;
               w.sharesFound = data.sharesFound ?? w.sharesFound;
               w.sharesAccepted = data.sharesAccepted ?? w.sharesAccepted;
@@ -469,8 +469,10 @@ async function startServer() {
               w.hashrateHistory.push({ time: now, hashrate: w.hashrateMhs });
               if (w.hashrateHistory.length > 30) w.hashrateHistory.shift();
 
-              w.tempHistory.push({ time: now, temp: w.tempC });
-              if (w.tempHistory.length > 30) w.tempHistory.shift();
+              if (typeof w.tempC === 'number') {
+                w.tempHistory.push({ time: now, temp: w.tempC });
+                if (w.tempHistory.length > 30) w.tempHistory.shift();
+              }
 
               broadcastToClients({ type: "worker_update", worker: w });
             }

@@ -16,7 +16,7 @@ export interface WorkerTelemetry {
   threads: number;
   maxCores: number;
   hashrateMhs: number;
-  tempC: number;
+  tempC: number | null;
   cpuFreqMhz: number;
   sharesFound: number;
   sharesAccepted: number;

@@ -4,13 +4,11 @@ CRYPTO_FLAGS = -march=armv8-a+crypto
 TARGET = bitcoin_sha256d_s905x
 SRC = bitcoin_sha256d_s905x.c
 
-# Auto-detect AArch64 architecture
-UNAME_M := $(shell uname -m)
-ifeq ($(UNAME_M),aarch64)
-    BUILD_FLAGS = $(CFLAGS) $(CRYPTO_FLAGS)
-else
-    BUILD_FLAGS = $(CFLAGS)
-endif
+# Generic flags on every host: the ARMv8 HW-SHA functions opt into the Crypto
+# Extension per-function via target("+crypto") and runtime HWCAP_SHA2 dispatch
+# selects the backend, so one binary serves S905X (HW) and S905-class cores
+# lacking the extension (SW fallback).
+BUILD_FLAGS = $(CFLAGS)
 
 .PHONY: all crypto generic test benchmark clean help
 
@@ -37,7 +35,7 @@ clean:
 help:
 	@echo "S905X Bitcoin SHA-256d Miner Makefile"
 	@echo "Targets:"
-	@echo "  make            - Build native binary (auto-detects aarch64 +crypto)"
+	@echo "  make            - Build native binary (runtime-selects ARMv8 SHA backend when present)"
 	@echo "  make crypto     - Force AArch64 ARMv8 Crypto build (-march=armv8-a+crypto)"
 	@echo "  make generic    - Build generic portable binary (software fallback)"
 	@echo "  make test       - Build and execute correctness test suite (-t)"

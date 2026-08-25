@@ -223,11 +223,15 @@ export const WorkerDetailsModal: React.FC<WorkerDetailsModalProps> = ({
                 <div className="space-y-2 text-xs">
                   <div className="flex justify-between py-1 border-b border-zinc-800/60">
                     <span className="text-zinc-400">Processor</span>
-                    <span className="font-mono text-zinc-200">Amlogic S905X (4x Cortex-A53)</span>
+                    <span className="font-mono text-zinc-200">{worker.arch || 'Amlogic S905X (4x Cortex-A53)'}</span>
                   </div>
                   <div className="flex justify-between py-1 border-b border-zinc-800/60">
                     <span className="text-zinc-400">ARMv8 Crypto Extension</span>
-                    <span className="font-mono text-emerald-400 font-semibold">Enabled (+crypto / sha256_hw)</span>
+                    {worker.hwCrypto ? (
+                      <span className="font-mono text-emerald-400 font-semibold">Enabled (+crypto / sha256_hw)</span>
+                    ) : (
+                      <span className="font-mono text-zinc-400 font-semibold">Not available (software fallback)</span>
+                    )}
                   </div>
                   <div className="flex justify-between py-1 border-b border-zinc-800/60">
                     <span className="text-zinc-400">Active CPU Frequency</span>
@@ -235,7 +239,7 @@ export const WorkerDetailsModal: React.FC<WorkerDetailsModalProps> = ({
                   </div>
                   <div className="flex justify-between py-1 border-b border-zinc-800/60">
                     <span className="text-zinc-400">Thermal Sensor Zone 0</span>
-                    <span className="font-mono text-amber-400 font-semibold">{worker.tempC.toFixed(1)} °C</span>
+                    <span className="font-mono text-amber-400 font-semibold">{worker.tempC != null ? `${worker.tempC.toFixed(1)} °C` : 'N/A'}</span>
                   </div>
                 </div>
               </div>

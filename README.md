@@ -93,15 +93,30 @@ connects to workers, so boxes need no inbound firewall rules.
 
 ## S905X / ARM64 Support
 
-The miner auto-detects the build host architecture:
+The miner builds a portable AArch64 binary: the ARMv8 Crypto Extension hashing
+functions opt in per-function via `target("+crypto")`, and at startup the miner
+checks `getauxval(AT_HWCAP) & HWCAP_SHA2` and selects the hardware backend only
+when the CPU actually advertises SHA-2. Cores without the extension (e.g. the
+original Amlogic S905 / GXBB) automatically run the software fallback instead —
+one binary serves both SoC families:
 
-- On **aarch64** the Makefile adds `-march=armv8-a+crypto` and the hashing core
-  uses ARMv8 Crypto Extension intrinsics (SHA-256 rounds in hardware).
-- On any other architecture it builds a generic software fallback, so the same
-  source compiles and passes tests on x86 development machines.
+- **S905X-class (GXL)**: crypto extension present → `sha256_hw` backend.
+- **S905-class (GXBB)**: no crypto extension → portable C software backend.
+
+The Python agent detects the same capability from `/proc/cpuinfo` (`Features`
+line) and reports it truthfully in `auth` (`hwCrypto`), along with the CPU
+model string in `arch`. Thermal readings that are physically impossible
+(e.g. the GXBB SCPI invalid sentinel `-1000`) are reported as `tempC: null`
+rather than fabricated numbers.
 
 The reference hardware is an Amlogic S905X box (Cortex-A53, 4× cores) running
-Armbian; the production deployment compiles natively on the box itself.
+Armbian; the production deployment compiles natively on the box itself. Both SoC
+families have been benchmarked side by side on real hardware (`-j 3 -c 3`,
+≥30 min per mode): S905X sustains **~9.0 MH/s** mining a live pool / **10.1 MH/s**
+synthetic with the crypto backend, while an original S905 (GXBB, software
+fallback) sustains **~1.0 MH/s** in both modes — all at flat ceiling clocks with
+zero throttling. Methodology, thermal caveats, and full results:
+[docs/s905-integration.md](docs/s905-integration.md).
 
 A layered analysis of how far the stack can be stripped toward a minimal
 kernel or bare metal — with measured baselines and a built-but-unbooted 10.3 MB
@@ -267,11 +282,15 @@ Communication occurs over JSON WebSocket messages on `/ws/worker`:
   "cores": 4,
   "arch": "aarch64 Cortex-A53",
   "hwCrypto": true,
-  "agentVersion": "2.1.0"
+  "agentVersion": "2.2.0"
 }
 ```
+`arch` is the detected CPU model string and `hwCrypto` reflects the kernel's
+advertised ARMv8 SHA-2 support (S905X-class: `true`; S905/GXBB-class: `false`).
 
 ### 2. Live Telemetry Heartbeat (Worker → Server, 2 s interval)
+`tempC` is a number when the thermal sensor is valid, or `null` when no
+trustworthy reading exists (the dashboard renders `N/A`).
 ```json
 {
   "type": "telemetry",

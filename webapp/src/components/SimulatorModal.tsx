@@ -113,7 +113,7 @@ export const SimulatorModal: React.FC<SimulatorModalProps> = ({
                         <span>•</span>
                         <span className="text-orange-400 font-mono font-semibold">{w.hashrateMhs.toFixed(2)} MH/s</span>
                         <span>•</span>
-                        <span className="text-amber-400 font-mono">{w.tempC.toFixed(1)} °C</span>
+                        <span className="text-amber-400 font-mono">{w.tempC != null ? `${w.tempC.toFixed(1)} °C` : 'N/A'}</span>
                       </div>
                     </div>
 

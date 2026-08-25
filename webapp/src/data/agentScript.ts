@@ -23,6 +23,7 @@ import subprocess
 import threading
 import signal
 import re
+import platform
 
 try:
     import asyncio
@@ -46,6 +47,7 @@ class S905XWorkerAgent:
         # State
         self.state = "STOPPED"  # RUNNING, STOPPED, ERROR, RESTARTING
         self.max_cores = os.cpu_count() or 4
+        self.arch, self.hw_crypto = self.detect_hw_profile()
         # Optimal default on 4-core S905X: 3 hashing cores + 1 control core
         self.threads = 3 if self.max_cores >= 4 else max(1, self.max_cores - 1)
         self.control_core = 3 if self.max_cores >= 4 else max(0, self.max_cores - 1)
@@ -69,7 +71,13 @@ class S905XWorkerAgent:
         self.running = True
 
     def get_cpu_temp(self):
-        """Read S905X on-die thermal sensor in Celsius"""
+        """Read on-die thermal sensor in Celsius.
+
+        Returns None when every available source yields an impossible reading
+        (e.g. the S905/GXBB SCPI invalid sentinel -1000 m°C == -1.0 °C, or the
+        0xFFFFFFFF hwmon artifact), so the controller can display N/A instead
+        of fabricated values. These sensors never legitimately read <= 0 °C.
+        """
         paths = [
             "/sys/class/thermal/thermal_zone0/temp",
             "/sys/devices/virtual/thermal/thermal_zone0/temp",
@@ -80,10 +88,48 @@ class S905XWorkerAgent:
                 try:
                     with open(p, "r") as f:
                         raw = int(f.read().strip())
-                        return round(raw / 1000.0, 1) if raw > 1000 else float(raw)
+                        celsius = raw / 1000.0
+                        if 0.0 < celsius <= 150.0:
+                            return round(celsius, 1)
                 except Exception:
                     pass
-        return 48.5
+        return None
+
+    @staticmethod
+    def detect_hw_profile():
+        """Return (arch_string, hw_crypto_bool) from the running system.
+
+        hw_crypto reflects whether the kernel advertises the ARMv8 SHA-2
+        crypto extension (HWCAP sha2) — true on S905X-class cores, false on
+        S905/GXBB-class cores lacking it.
+        """
+        machine = platform.machine() or "unknown"
+        model = ""
+        features = set()
+        try:
+            with open("/proc/cpuinfo", "r") as f:
+                for line in f:
+                    key, _, val = line.partition(":")
+                    key, val = key.strip(), val.strip()
+                    if key == "Features":
+                        features.update(val.split())
+                    elif key == "model name" and val and not model:
+                        model = val
+        except Exception:
+            pass
+        try:
+            out = subprocess.run(["lscpu"], capture_output=True, text=True,
+                                 timeout=5).stdout
+            for line in out.splitlines():
+                if line.startswith("Model name:"):
+                    val = line.split(":", 1)[1].strip()
+                    if val:
+                        model = val
+                    break
+        except Exception:
+            pass
+        arch = f"{machine} {model}".strip()
+        return arch, "sha2" in features
 
     def get_cpu_freq(self):
         """Read S905X CPU current scaling frequency in MHz"""
@@ -318,9 +364,9 @@ class S905XWorkerAgent:
                         "token": self.token,
                         "name": self.worker_name,
                         "cores": self.max_cores,
-                        "arch": "aarch64 Cortex-A53",
-                        "hwCrypto": True,
-                        "agentVersion": "2.1.0"
+                        "arch": self.arch,
+                        "hwCrypto": self.hw_crypto,
+                        "agentVersion": "2.2.0"
                     }
                     await ws.send(json.dumps(auth_msg))
 
@@ -408,7 +454,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 `;
 
 export const S905X_SYSTEMD_SERVICE = `[Unit]
