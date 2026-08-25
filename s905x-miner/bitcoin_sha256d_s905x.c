@@ -441,6 +441,26 @@ static void bitcoin_midstate_init(bitcoin_midstate_t *ms, const uint8_t header[8
 }
 
 /*
+ * Store 8 x uint32 as 32 bytes in big-endian (network) byte order.
+ * NEON path uses vrev32q_u8 (2 instructions vs ~40 compiler-generated).
+ */
+static inline void be32_store(uint8_t dst[32], const uint32_t src[8]) {
+#if defined(HAVE_ARM_SHA2_TARGET)
+    uint8x16_t lo = vrev32q_u8(vreinterpretq_u8_u32(vld1q_u32(&src[0])));
+    uint8x16_t hi = vrev32q_u8(vreinterpretq_u8_u32(vld1q_u32(&src[4])));
+    vst1q_u8(dst, lo);
+    vst1q_u8(dst + 16, hi);
+#else
+    for (int i = 0; i < 8; i++) {
+        dst[i * 4 + 0] = (uint8_t)((src[i] >> 24) & 0xFF);
+        dst[i * 4 + 1] = (uint8_t)((src[i] >> 16) & 0xFF);
+        dst[i * 4 + 2] = (uint8_t)((src[i] >> 8)  & 0xFF);
+        dst[i * 4 + 3] = (uint8_t)( src[i]        & 0xFF);
+    }
+#endif
+}
+
+/*
  * Optimized Double-SHA256 evaluation for a specific nonce using precomputed midstate.
  * Runs exactly 2 compression rounds (instead of 3) with zero heap or stream overhead.
  */
@@ -461,13 +481,7 @@ static inline void bitcoin_hash_nonce_opt(const bitcoin_midstate_t *ms, uint32_t
 
     /* --- Pass 2, Single Block: SHA-256 of 32-byte intermediate hash --- */
     uint8_t b_pass2[64];
-    /* Write 32-byte intermediate digest in big-endian */
-    for (int i = 0; i < 8; i++) {
-        b_pass2[i * 4 + 0] = (uint8_t)((state1[i] >> 24) & 0xFF);
-        b_pass2[i * 4 + 1] = (uint8_t)((state1[i] >> 16) & 0xFF);
-        b_pass2[i * 4 + 2] = (uint8_t)((state1[i] >> 8)  & 0xFF);
-        b_pass2[i * 4 + 3] = (uint8_t)( state1[i]        & 0xFF);
-    }
+    be32_store(b_pass2, state1);
     b_pass2[32] = 0x80;
     memset(b_pass2 + 33, 0, 23);
     /* 32 bytes = 256 bits = 0x0000000000000100 */
@@ -479,13 +493,7 @@ static inline void bitcoin_hash_nonce_opt(const bitcoin_midstate_t *ms, uint32_t
 
     sha256_compress_fn(state2, b_pass2);
 
-    /* Serialize final hash */
-    for (int i = 0; i < 8; i++) {
-        hash[i * 4 + 0] = (uint8_t)((state2[i] >> 24) & 0xFF);
-        hash[i * 4 + 1] = (uint8_t)((state2[i] >> 16) & 0xFF);
-        hash[i * 4 + 2] = (uint8_t)((state2[i] >> 8)  & 0xFF);
-        hash[i * 4 + 3] = (uint8_t)( state2[i]        & 0xFF);
-    }
+    be32_store(hash, state2);
 }
 
 /* ============================================================================
