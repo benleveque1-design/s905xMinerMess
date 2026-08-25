@@ -303,9 +303,17 @@ typedef void (*sha256_compress_fn_t)(uint32_t state[8], const uint8_t block[64])
 static sha256_compress_fn_t sha256_compress_fn = sha256_compress_sw;
 static const char *backend_name = "software (portable C, no HW crypto)";
 
-/* Body moved after Section 6 to reference bitcoin_hash_nonce_opt_hw.
- * This forward declaration lets main() call it. */
-static void select_sha256_backend(void);
+static void select_sha256_backend(void) {
+    if (cpu_has_sha256_hw()) {
+#if defined(HAVE_ARM_SHA2_TARGET)
+        sha256_compress_fn = sha256_compress_hw;
+        backend_name = "ARMv8 Crypto Extension (SHA256H/H2/SU0/SU1, S905X Cortex-A53)";
+        return;
+#endif
+    }
+    sha256_compress_fn = sha256_compress_sw;
+    backend_name = "software (portable C fallback - HWCAP_SHA2 not present)";
+}
 
 /* ============================================================================
  * SECTION 5: SHA-256 High-Level Wrapper
@@ -478,71 +486,6 @@ static inline void bitcoin_hash_nonce_opt(const bitcoin_midstate_t *ms, uint32_t
         hash[i * 4 + 2] = (uint8_t)((state2[i] >> 8)  & 0xFF);
         hash[i * 4 + 3] = (uint8_t)( state2[i]        & 0xFF);
     }
-}
-
-/*
- * HW-direct variant: calls sha256_compress_hw() directly, eliminating
- * the function-pointer indirection of sha256_compress_fn (2 indirect
- * calls per hash → 0).  All other logic is identical to bitcoin_hash_nonce_opt.
- */
-#if defined(HAVE_ARM_SHA2_TARGET)
-__attribute__((target("+crypto")))
-static inline void bitcoin_hash_nonce_opt_hw(const bitcoin_midstate_t *ms, uint32_t nonce, uint8_t hash[32]) {
-    uint32_t state1[8];
-    memcpy(state1, ms->midstate, sizeof(state1));
-
-    uint8_t b2[64];
-    memcpy(b2, ms->block2, 64);
-    b2[12] = (uint8_t)( nonce        & 0xFF);
-    b2[13] = (uint8_t)((nonce >> 8)  & 0xFF);
-    b2[14] = (uint8_t)((nonce >> 16) & 0xFF);
-    b2[15] = (uint8_t)((nonce >> 24) & 0xFF);
-
-    sha256_compress_hw(state1, b2);
-
-    uint8_t b_pass2[64];
-    for (int i = 0; i < 8; i++) {
-        b_pass2[i * 4 + 0] = (uint8_t)((state1[i] >> 24) & 0xFF);
-        b_pass2[i * 4 + 1] = (uint8_t)((state1[i] >> 16) & 0xFF);
-        b_pass2[i * 4 + 2] = (uint8_t)((state1[i] >> 8)  & 0xFF);
-        b_pass2[i * 4 + 3] = (uint8_t)( state1[i]        & 0xFF);
-    }
-    b_pass2[32] = 0x80;
-    memset(b_pass2 + 33, 0, 23);
-    b_pass2[56] = 0; b_pass2[57] = 0; b_pass2[58] = 0; b_pass2[59] = 0;
-    b_pass2[60] = 0; b_pass2[61] = 0; b_pass2[62] = 0x01; b_pass2[63] = 0x00;
-
-    uint32_t state2[8];
-    memcpy(state2, SHA256_H0, sizeof(SHA256_H0));
-
-    sha256_compress_hw(state2, b_pass2);
-
-    for (int i = 0; i < 8; i++) {
-        hash[i * 4 + 0] = (uint8_t)((state2[i] >> 24) & 0xFF);
-        hash[i * 4 + 1] = (uint8_t)((state2[i] >> 16) & 0xFF);
-        hash[i * 4 + 2] = (uint8_t)((state2[i] >> 8)  & 0xFF);
-        hash[i * 4 + 3] = (uint8_t)( state2[i]        & 0xFF);
-    }
-}
-#endif
-
-/* Dispatch pointer for the hot-path nonce hash. */
-typedef void (*bitcoin_nonce_fn_t)(const bitcoin_midstate_t *, uint32_t, uint8_t[32]);
-static bitcoin_nonce_fn_t bitcoin_nonce_fn;
-
-/* Backend dispatch — now placed after the nonce hash variants it references. */
-static void select_sha256_backend(void) {
-    if (cpu_has_sha256_hw()) {
-#if defined(HAVE_ARM_SHA2_TARGET)
-        sha256_compress_fn = sha256_compress_hw;
-        bitcoin_nonce_fn = bitcoin_hash_nonce_opt_hw;
-        backend_name = "ARMv8 Crypto Extension (SHA256H/H2/SU0/SU1, S905X Cortex-A53)";
-        return;
-#endif
-    }
-    sha256_compress_fn = sha256_compress_sw;
-    bitcoin_nonce_fn = bitcoin_hash_nonce_opt;
-    backend_name = "software (portable C fallback - HWCAP_SHA2 not present)";
 }
 
 /* ============================================================================
@@ -1356,7 +1299,7 @@ static void *stratum_hash_worker(void *arg) {
 
         /* Tight inner hashing loop */
         for (uint32_t iter = 0; iter < HASH_CHECK_INTERVAL; iter++) {
-            bitcoin_nonce_fn(&local_ms, nonce, raw_hash);
+            bitcoin_hash_nonce_opt(&local_ms, nonce, raw_hash);
 
             /* Reverse raw hash to display hash (big-endian 256-bit value) */
             reverse_bytes(display_hash, raw_hash, 32);
@@ -1866,7 +1809,7 @@ static void *bench_worker(void *arg) {
 
     for (uint64_t i = 0; i < targ->count; i++) {
         uint32_t nonce = (uint32_t)(targ->start_nonce + i);
-        bitcoin_nonce_fn(&ms, nonce, hash);
+        bitcoin_hash_nonce_opt(&ms, nonce, hash);
     }
 
     memcpy(targ->final_hash, hash, 32);
@@ -2366,7 +2309,6 @@ int main(int argc, char *argv[]) {
     select_sha256_backend();
     if (force_sw) {
         sha256_compress_fn = sha256_compress_sw;
-        bitcoin_nonce_fn = bitcoin_hash_nonce_opt;
         backend_name = "software (forced via -s / --sw-only)";
     }
     printf("SHA-256 backend selected: %s\n\n", backend_name);
