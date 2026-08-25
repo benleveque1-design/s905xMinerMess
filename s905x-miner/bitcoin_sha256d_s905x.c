@@ -1853,9 +1853,40 @@ static void *bench_worker(void *arg) {
 
 #if defined(HAVE_ARM_SHA2_TARGET)
     if (sha256_compress_fn == sha256_compress_hw) {
+        /*
+         * Pre-initialize invariant block data outside the hot loop.
+         * sha256_compress_hw never writes to the block argument (verified in
+         * assembly: only store is stp to state), so pre-initialized data
+         * persists across compress calls.
+         */
+        uint8_t b2_local[64];
+        memcpy(b2_local, ms.block2, 64);
+
+        uint8_t pass2_local[64];
+        memset(pass2_local, 0, 64);
+        pass2_local[32] = 0x80;
+        pass2_local[62] = 0x01;
+
+        uint32_t state1[8];
+        uint32_t state2[8];
+
         for (uint64_t i = 0; i < targ->count; i++) {
             uint32_t nonce = (uint32_t)(targ->start_nonce + i);
-            bitcoin_hash_nonce_opt_hw(&ms, nonce, hash);
+
+            b2_local[12] = (uint8_t)( nonce        & 0xFF);
+            b2_local[13] = (uint8_t)((nonce >> 8)  & 0xFF);
+            b2_local[14] = (uint8_t)((nonce >> 16) & 0xFF);
+            b2_local[15] = (uint8_t)((nonce >> 24) & 0xFF);
+
+            memcpy(state1, ms.midstate, sizeof(state1));
+            sha256_compress_hw(state1, b2_local);
+
+            be32_store(pass2_local, state1);
+
+            memcpy(state2, SHA256_H0, sizeof(SHA256_H0));
+            sha256_compress_hw(state2, pass2_local);
+
+            be32_store(hash, state2);
         }
     } else
 #endif
