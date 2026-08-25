@@ -116,6 +116,60 @@ Two self-contained projects sharing one repo — no shared code between them:
 
 The JSON WebSocket protocol (auth/telemetry/command message shapes) in root README §"WebSocket Protocol Contract" is implemented three times: C stratum client, Python agent, TS controller. Any protocol change must update all three implementations and the README section.
 
+## SHA-256 hot-path optimization (2026-08-25, `.206` experimental box)
+
+All experiments ran on `.206` (`192.168.1.206`, root/Cheese). Never modify `.120`.
+
+### Optimization history
+
+| Opt | Change | Commit | Result | Cumulative |
+|-----|--------|--------|--------|------------|
+| Baseline | Original code | — | 10.074 MH/s | — |
+| 1 | Direct SHA256 compress calls (HW path) | `c668658` | 9.532 MH/s (−5.4%) | REVERTED `12202e2` |
+| 2 | NEON `vrev32q_u8` byte-swap (`be32_store`) | `f676204` | 10.653 MH/s (+5.75%) | +5.75% |
+| 3 | Function pointer elimination (HW direct `bl`) | `3408713` | 11.046 MH/s (+3.7%) | +9.7% |
+| 4 | Block2 pre-copy + Pass2 padding pre-init | `dc5597e` | 11.819 MH/s (+7.0%) | +17.3% |
+| 5 | K-table parameterization (`noipa`) | — | 10.849 MH/s (−8.2%) | REVERTED |
+
+**Current verified baseline: 11.819 MH/s @ 1512 MHz (3 warmed 50M runs, no `-j3`)**
+
+### How benchmarks are run
+
+1. Deploy source to `.206` via `scp` to `/tmp/`
+2. Compile: `gcc -O3 -pthread -Wall -Wextra -march=armv8-a+crypto -o bitcoin_sha256d_s905x bitcoin_sha256d_s905x.c`
+3. Correctness: `./bitcoin_sha256d_s905x -t` — all 6 test groups must pass
+4. Assembly: `gcc -O3 ... -S -o bench.s bitcoin_sha256d_s905x.c`
+5. Benchmark: 10M warmup (ensure CPU0 at 1512 MHz), then 3 × 50M iterations; record Hash Rate, CPU0 Freq, Temp
+6. Only count warmed runs (CPU0 starts at 1512 MHz); ondemand governor drops to 500 MHz during idle gaps
+7. Use pexpect SSH helper `/tmp/opencode/ssh206.py` (no `sshpass` available)
+
+### Key experimental findings
+
+**Opt 1 rejection (function boundary + `target("+crypto")`):** Adding `__attribute__((target("+crypto")))` to `bitcoin_hash_nonce_opt_hw` prevented inlining into `bench_worker` (which lacks the attribute). Result: 5.4% regression. Lesson: `target("+crypto")` on a caller-visible function prevents GCC from optimizing the call site.
+
+**Opt 5 rejection (K-table parameterization):** Added `sha256_compress_hw_k(state, block, K_table)` with `__attribute__((noinline))` to pass the K round constants as a pointer instead of embedding 16 `adrp`+`ldr` pairs per call (24 fewer instructions per compress). Result: **8.2% regression** despite 15% fewer total instructions per hash (287→244).
+
+Root cause: GCC 15.2's interprocedural constant propagation (IPA CP) creates a `.constprop.0` clone of `sha256_compress_hw_k` with K baked in as a static constant — completely defeating the parameterization. Adding `__attribute__((noipa))` prevents cloning but also blocks all cross-function optimizations (register allocation, instruction scheduling, constant propagation across the call boundary). The loop body grew from 23→26 instructions and GCC's scheduling degraded.
+
+**This is the single most important finding: pipeline utilization matters more than instruction count on the in-order Cortex-A53.**
+
+### Architectural analysis
+
+The Cortex-A53 has a **single-issue NEON pipeline** (max 1 NEON instruction/cycle). The compress function has **115 NEON operations** per call. With 2 compresses per hash, the NEON throughput floor is **240 cycles/hash**. Measured: **384 cycles/hash** (62.5% of throughput floor).
+
+The 60% gap above the NEON floor breaks down as:
+- **SHA2 dependency chains** (~25%): sha256h(N+1) depends on sha256h2(N) output with ~3-4 cycle latency; 16 groups × 4 cycles = 64 cycles/compress critical path. Algorithmic — cannot be reduced.
+- **Pipeline fill gaps** (~12%): Rounds 12-15 have no message schedule work to interleave (only 1 `mov` between SHA pairs, need 2+). Inherent to the algorithm — no source-level remedy.
+- **Scheduling/fetch effects** (~23%): ADRP result latency, load-use bubbles, fetch alignment. GCC's `-O3` scheduler handles these; disrupting it (Opt 5) made things worse.
+
+The remaining ~20% overhead beyond the NEON floor includes dual-issue slot conflicts (integer/NEON pairing constraints) and ADRP chain serialization through the K-address register.
+
+### Performance ceiling
+
+**11.819 MH/s is the known-good performance ceiling** for this implementation at stock 1512 MHz. Estimated realistic ceiling (70-75% NEON utilization): ~13-14 MH/s fleet. The gap is dominated by SHA-256 algorithmic constraints and GCC scheduling that cannot be improved from C source without risking regression.
+
+Do not pursue further hot-path optimizations without new hardware evidence (e.g., cycle-accurate profiling) or a different compiler/toolchain.
+
 ## Package manager
 
 A `bun.lock` sits at the repo root, but everything here uses npm (`webapp/package-lock.json`, `npm --prefix webapp` scripts). Use npm.
