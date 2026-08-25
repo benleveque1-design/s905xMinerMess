@@ -496,6 +496,42 @@ static inline void bitcoin_hash_nonce_opt(const bitcoin_midstate_t *ms, uint32_t
     be32_store(hash, state2);
 }
 
+#if defined(HAVE_ARM_SHA2_TARGET)
+/*
+ * HW-direct variant: calls sha256_compress_hw directly instead of through the
+ * function pointer. Eliminates two indirect branches (blr) per hash.
+ * Deliberately does NOT carry __attribute__((target("+crypto"))) so the
+ * compiler can inline this into bench_worker (which lacks the attribute).
+ */
+static inline void bitcoin_hash_nonce_opt_hw(const bitcoin_midstate_t *ms, uint32_t nonce, uint8_t hash[32]) {
+    uint32_t state1[8];
+    memcpy(state1, ms->midstate, sizeof(state1));
+
+    uint8_t b2[64];
+    memcpy(b2, ms->block2, 64);
+    b2[12] = (uint8_t)( nonce        & 0xFF);
+    b2[13] = (uint8_t)((nonce >> 8)  & 0xFF);
+    b2[14] = (uint8_t)((nonce >> 16) & 0xFF);
+    b2[15] = (uint8_t)((nonce >> 24) & 0xFF);
+
+    sha256_compress_hw(state1, b2);
+
+    uint8_t b_pass2[64];
+    be32_store(b_pass2, state1);
+    b_pass2[32] = 0x80;
+    memset(b_pass2 + 33, 0, 23);
+    b_pass2[56] = 0; b_pass2[57] = 0; b_pass2[58] = 0; b_pass2[59] = 0;
+    b_pass2[60] = 0; b_pass2[61] = 0; b_pass2[62] = 0x01; b_pass2[63] = 0x00;
+
+    uint32_t state2[8];
+    memcpy(state2, SHA256_H0, sizeof(SHA256_H0));
+
+    sha256_compress_hw(state2, b_pass2);
+
+    be32_store(hash, state2);
+}
+#endif
+
 /* ============================================================================
  * SECTION 7: Bitcoin Block Header Construction & Byte Ordering
  * ============================================================================ */
@@ -1815,9 +1851,19 @@ static void *bench_worker(void *arg) {
     bitcoin_midstate_t ms;
     bitcoin_midstate_init(&ms, header_buf);
 
-    for (uint64_t i = 0; i < targ->count; i++) {
-        uint32_t nonce = (uint32_t)(targ->start_nonce + i);
-        bitcoin_hash_nonce_opt(&ms, nonce, hash);
+#if defined(HAVE_ARM_SHA2_TARGET)
+    if (sha256_compress_fn == sha256_compress_hw) {
+        for (uint64_t i = 0; i < targ->count; i++) {
+            uint32_t nonce = (uint32_t)(targ->start_nonce + i);
+            bitcoin_hash_nonce_opt_hw(&ms, nonce, hash);
+        }
+    } else
+#endif
+    {
+        for (uint64_t i = 0; i < targ->count; i++) {
+            uint32_t nonce = (uint32_t)(targ->start_nonce + i);
+            bitcoin_hash_nonce_opt(&ms, nonce, hash);
+        }
     }
 
     memcpy(targ->final_hash, hash, 32);
