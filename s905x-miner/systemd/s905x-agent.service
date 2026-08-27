@@ -12,6 +12,7 @@ WorkingDirectory=/opt/s905xMinerMess/s905x-miner
 #   WORKER_AUTH_TOKEN=<shared controller token>
 #   CONTROLLER_WS_URL=ws://<controller-host>:3010/ws/worker
 EnvironmentFile=/etc/default/s905x-agent
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/usr/bin/python3 /opt/s905xMinerMess/s905x-miner/agent/s905x_agent.py \
   --miner /opt/s905xMinerMess/s905x-miner/bitcoin_sha256d_s905x \
   --autostart
