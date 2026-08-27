@@ -56,12 +56,13 @@ const workers = new Map<string, WorkerRecord>();
 const workerSockets = new Map<string, WebSocket>();
 const clientSockets = new Set<WebSocket>();
 
+const envPoolUrl = process.env.POOL_URL;
 let globalPool = {
-  url: "stratum+tcp://solo.ckpool.org:3333",
-  user: "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh.s905x",
-  pass: "x",
-  name: "Solo CKPool",
-  isSolo: true,
+  url: envPoolUrl ?? "stratum+tcp://solo.ckpool.org:3333",
+  user: process.env.POOL_USER ?? "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh.s905x",
+  pass: process.env.POOL_PASS ?? "x",
+  name: envPoolUrl ? "Based Mining" : "Solo CKPool",
+  isSolo: !envPoolUrl,
 };
 
 // Broadcast message to all connected Web Dashboard clients
