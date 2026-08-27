@@ -52,10 +52,15 @@ class S905XWorkerAgent:
         self.threads = 3 if self.max_cores >= 4 else max(1, self.max_cores - 1)
         self.control_core = 3 if self.max_cores >= 4 else max(0, self.max_cores - 1)
         
+        # Pool: env vars override the hardcoded default when set
+        env_pool_url = os.environ.get("MINER_POOL_URL")
+        env_pool_user = os.environ.get("MINER_POOL_USER")
+        env_pool_pass = os.environ.get("MINER_POOL_PASS")
+        self.pool_env_override = bool(env_pool_url)
         self.pool = {
-            "url": "stratum+tcp://solo.ckpool.org:3333",
-            "user": "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh.s905x",
-            "pass": "x"
+            "url": env_pool_url or "stratum+tcp://solo.ckpool.org:3333",
+            "user": env_pool_user or "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh.s905x",
+            "pass": env_pool_pass or "x"
         }
         
         # Metrics
@@ -69,6 +74,15 @@ class S905XWorkerAgent:
         self.miner_process = None
         self.miner_stdout_thread = None
         self.running = True
+
+        self._lock = threading.Lock()
+        self.desired_state = "STOPPED"
+        self._watchdog_fail_count = 0
+        self._watchdog_fail_window_start = 0
+        self._watchdog_last_success = 0
+
+        self.thermal_trip_c = float(os.environ.get("AGENT_THERMAL_TRIP_C", "80.0"))
+        self._zero_hash_start = None
 
     def get_cpu_temp(self):
         """Read on-die thermal sensor in Celsius.
@@ -200,6 +214,7 @@ class S905XWorkerAgent:
                 bufsize=1
             )
             self.state = "RUNNING"
+            self.desired_state = "RUNNING"
             self.start_time = time.time()
             
             # Start background stdout reader thread
@@ -221,6 +236,7 @@ class S905XWorkerAgent:
         self.miner_process = None
         self.state = "STOPPED"
         self.hashrate_mhs = 0.0
+        self.desired_state = "STOPPED"
         return True, "Miner stopped"
 
     def restart_miner(self):
@@ -291,6 +307,61 @@ class S905XWorkerAgent:
             self.state = "STOPPED"
             self.hashrate_mhs = 0.0
 
+    def _watchdog_loop(self):
+        """Daemon thread: respawn miner if it crashed while desired_state is RUNNING"""
+        while self.running:
+            time.sleep(10.0)
+            with self._lock:
+                desired = self.desired_state
+                proc = self.miner_process
+
+            if desired != "RUNNING" or proc is None:
+                continue
+
+            if proc.poll() is None:
+                now = time.time()
+                if self.hashrate_mhs > 0.0:
+                    if self._watchdog_last_success == 0:
+                        self._watchdog_last_success = now
+                    elif now - self._watchdog_last_success >= 300.0:
+                        self._watchdog_fail_count = 0
+                        self._watchdog_fail_window_start = 0
+                        self._watchdog_last_success = now
+                continue
+
+            rc = proc.returncode
+            now = time.time()
+            self._watchdog_last_success = 0
+
+            if self._watchdog_fail_window_start and now - self._watchdog_fail_window_start <= 600.0:
+                self._watchdog_fail_count += 1
+            else:
+                self._watchdog_fail_window_start = now
+                self._watchdog_fail_count = 1
+
+            if self._watchdog_fail_count >= 6:
+                with self._lock:
+                    self.state = "ERROR"
+                    self.desired_state = "STOPPED"
+                print("[Watchdog] too many fast failures; giving up. Manual start/restart required.")
+                continue
+
+            fail_idx = min(self._watchdog_fail_count - 1, 4)
+            delays = [5, 10, 20, 40, 60]
+            delay = delays[fail_idx]
+
+            print(f"[Watchdog] miner exited rc={rc}; respawn in {delay}s")
+            time.sleep(delay)
+
+            if not self.running or self.desired_state != "RUNNING":
+                continue
+
+            ok, msg = self.start_miner()
+            if ok:
+                print(f"[Watchdog] respawned miner: {msg}")
+            else:
+                print(f"[Watchdog] respawn failed: {msg}")
+
     def _execute_command(self, cmd):
         """Blocking command execution. Always invoked off the event loop
         thread (asyncio.to_thread) so stop_miner()'s process wait and
@@ -348,6 +419,9 @@ class S905XWorkerAgent:
 
     async def run(self):
         """Main connection and telemetry loop"""
+        watchdog = threading.Thread(target=self._watchdog_loop, daemon=True)
+        watchdog.start()
+
         backoff = 1.0
         
         while self.running:
@@ -390,6 +464,23 @@ class S905XWorkerAgent:
                                 "pool": self.pool
                             }
                             await ws.send(json.dumps(telemetry))
+
+                            temp_c = telemetry["tempC"]
+                            if temp_c is not None and temp_c >= self.thermal_trip_c and self.state == "RUNNING":
+                                print(f"[Thermal] CRITICAL: temp {temp_c}\u00b0C >= {self.thermal_trip_c}\u00b0C trip threshold \u2014 miner stopped")
+                                await asyncio.to_thread(self.stop_miner)
+                                self.state = "ERROR"
+                                self.desired_state = "STOPPED"
+
+                            if self.state == "RUNNING" and self.hashrate_mhs == 0.0:
+                                if self._zero_hash_start is None:
+                                    self._zero_hash_start = time.time()
+                                elif time.time() - self._zero_hash_start >= 600.0:
+                                    print("[WARN] Miner running but hashrate 0 for \u2265600s \u2014 possible pool or connectivity issue")
+                                    self._zero_hash_start = None
+                            else:
+                                self._zero_hash_start = None
+
                             await asyncio.sleep(2.0)
 
                     # 3. Downstream command listener loop
@@ -404,7 +495,10 @@ class S905XWorkerAgent:
                                 elif msg_type == "auth_ack":
                                     print(f"[Agent] Authenticated with controller: {msg.get('status')}")
                                     if "pool" in msg:
-                                        self.pool.update(msg["pool"])
+                                        if self.pool_env_override:
+                                            print("[Agent] Pool set via MINER_POOL_URL env — ignoring controller auth_ack pool push")
+                                        else:
+                                            self.pool.update(msg["pool"])
                             except Exception as e:
                                 print(f"[Agent] Error processing message: {e}")
 
