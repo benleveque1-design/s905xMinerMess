@@ -7,3 +7,5 @@ coverage/
 .env*
 !.env.example
 s905x-miner/bitcoin_sha256d_s905x
+__pycache__/
+.omo/
