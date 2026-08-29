@@ -2193,10 +2193,10 @@ static void print_usage(const char *prog_name) {
     printf("Usage: %s [options]\n", prog_name);
     printf("Mining Options:\n");
     printf("  -M, --mine              Run live Stratum V1 Bitcoin miner.\n");
-    printf("  -P, --pool <URL>        Stratum pool URL (e.g. stratum+tcp://solo.ckpool.org:3333).\n");
+    printf("  -P, --pool <URL>        Stratum pool URL (e.g. stratum+tcp://pool.basedmining.xyz:3335).\n");
     printf("  -u, -U, --user <USER>   Stratum worker username / BTC address.\n");
     printf("  -p, --pass, --password  Stratum worker password (default: x).\n");
-    printf("  -j, --threads <N>       Hashing worker threads pinned to cores (default: 3 on 4-core).\n");
+    printf("  -j, --threads <N>       Hashing worker threads pinned to cores (default: 4 on 4-core).\n");
     printf("  -c, --control-core <N>  Control/network core (default: 3 on 4-core).\n");
     printf("  -o, --offset <N>        First CPU core to pin hash threads to (default: 0).\n");
     printf("  --no-pin                Disable CPU pinning.\n");
@@ -2213,7 +2213,7 @@ static void print_usage(const char *prog_name) {
 
 int main(int argc, char *argv[]) {
     int do_mine = 0;
-    char pool_url[256] = "stratum+tcp://solo.ckpool.org:3333";
+    char pool_url[256] = "stratum+tcp://pool.basedmining.xyz:3335";
     char pool_user[256] = "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh.s905x";
     char pool_pass[256] = "x";
     int do_test = 0;
@@ -2373,8 +2373,8 @@ int main(int argc, char *argv[]) {
     long total_cores = detect_core_count();
     if (!threads_specified) {
         if (total_cores == 4) {
-            /* 4-core S905X optimal layout: 3 dedicated SHA-256d hashing worker cores */
-            num_threads = 3;
+            /* 4-core S905X default: all 4 cores for hashing */
+            num_threads = 4;
         } else if (total_cores > 1) {
             num_threads = (int)total_cores - 1;
         } else {

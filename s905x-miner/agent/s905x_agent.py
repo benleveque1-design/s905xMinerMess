@@ -48,8 +48,8 @@ class S905XWorkerAgent:
         self.state = "STOPPED"  # RUNNING, STOPPED, ERROR, RESTARTING
         self.max_cores = os.cpu_count() or 4
         self.arch, self.hw_crypto = self.detect_hw_profile()
-        # Optimal default on 4-core S905X: 3 hashing cores + 1 control core
-        self.threads = 3 if self.max_cores >= 4 else max(1, self.max_cores - 1)
+        # Default on 4-core S905X: all 4 cores for hashing, control thread shares core 3
+        self.threads = 4 if self.max_cores >= 4 else max(1, self.max_cores - 1)
         self.control_core = 3 if self.max_cores >= 4 else max(0, self.max_cores - 1)
         
         # Pool: env vars override the hardcoded default when set
@@ -58,7 +58,7 @@ class S905XWorkerAgent:
         env_pool_pass = os.environ.get("MINER_POOL_PASS")
         self.pool_env_override = bool(env_pool_url)
         self.pool = {
-            "url": env_pool_url or "stratum+tcp://solo.ckpool.org:3333",
+            "url": env_pool_url or "stratum+tcp://pool.basedmining.xyz:3335",
             "user": env_pool_user or "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh.s905x",
             "pass": env_pool_pass or "x"
         }
@@ -193,7 +193,7 @@ class S905XWorkerAgent:
         
         # Check if live pool is configured
         if self.pool and self.pool.get("url"):
-            pool_url = self.pool.get("url", "stratum+tcp://solo.ckpool.org:3333")
+            pool_url = self.pool.get("url", "stratum+tcp://pool.basedmining.xyz:3335")
             pool_user = self.pool.get("user", "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh.s905x")
             pool_pass = self.pool.get("pass", "x")
             cmd.extend([
