@@ -7,5 +7,9 @@ coverage/
 .env*
 !.env.example
 s905x-miner/bitcoin_sha256d_s905x
+s905x-miner/bitcoin_sha256d_s905x_aarch64
 __pycache__/
 .omo/
+AGENTS.md
+webapp/controller-config.json
+docs/artifacts/

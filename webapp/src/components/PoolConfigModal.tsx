@@ -29,7 +29,7 @@ export const PoolConfigModal: React.FC<PoolConfigModalProps> = ({
   const [poolUser, setPoolUser] = useState<string>(currentPool.user);
   const [poolPass, setPoolPass] = useState<string>(currentPool.pass || 'x');
   const [walletAddress, setWalletAddress] = useState<string>(
-    currentPool.user.split('.')[0] || 'bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh'
+          currentPool.user.split('.')[0] || 'YOUR_BTC_ADDRESS'
   );
   const [workerSuffix, setWorkerSuffix] = useState<string>(
     currentPool.user.split('.')[1] || 's905x'

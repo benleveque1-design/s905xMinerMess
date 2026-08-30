@@ -12,9 +12,6 @@ import {
   PoolConfigModal 
 } from './components/PoolConfigModal';
 import { 
-  SimulatorModal 
-} from './components/SimulatorModal';
-import { 
   AgentInstallerModal 
 } from './components/AgentInstallerModal';
 import { 
@@ -41,7 +38,6 @@ export default function App() {
 
   // Modals state
   const [isPoolModalOpen, setIsPoolModalOpen] = useState(false);
-  const [isSimulatorModalOpen, setIsSimulatorModalOpen] = useState(false);
   const [isAgentModalOpen, setIsAgentModalOpen] = useState(false);
 
   // Toast feedback
@@ -192,29 +188,20 @@ export default function App() {
     showToast(`Stratum pool broadcast queued: ${newPool.url}`, 'info');
   };
 
-  // Simulator actions
-  const handleSpawnSimulator = (name: string) => {
-    fetch('/api/simulator/spawn', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...authHeaders() },
-      body: JSON.stringify({ name }),
-    })
-      .then((res) => res.json())
-      .then((data) => {
-        showToast(`Spawned simulated node: ${data.name}`, 'success');
+  const handleRestartController = async () => {
+    try {
+      const res = await fetch('/api/restart', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
       });
-  };
-
-  const handleKillSimulator = (workerId: string) => {
-    fetch('/api/simulator/kill', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...authHeaders() },
-      body: JSON.stringify({ workerId }),
-    })
-      .then((res) => res.json())
-      .then(() => {
-        showToast(`Removed simulated node ${workerId}`, 'info');
-      });
+      if (res.ok) {
+        showToast('Controller restarting — dashboard will reconnect shortly...', 'info');
+      } else {
+        showToast('Restart failed: unauthorized or server error', 'error');
+      }
+    } catch {
+      showToast('Controller restarting — dashboard will reconnect shortly...', 'info');
+    }
   };
 
   // Calculate Fleet Statistics
@@ -264,8 +251,8 @@ export default function App() {
         onStopAll={handleStopAll}
         onRestartAll={handleRestartAll}
         onOpenPoolConfig={() => setIsPoolModalOpen(true)}
-        onOpenSimulator={() => setIsSimulatorModalOpen(true)}
         onOpenAgentSetup={() => setIsAgentModalOpen(true)}
+        onRestartController={handleRestartController}
       />
 
       {/* Main Content Area */}
@@ -278,7 +265,6 @@ export default function App() {
           onSetThreads={handleSetThreads}
           onRename={handleRenameWorker}
           onOpenDetails={(w) => setSelectedWorker(w)}
-          onOpenSimulator={() => setIsSimulatorModalOpen(true)}
         />
       </main>
 
@@ -311,15 +297,6 @@ export default function App() {
           currentPool={poolConfig}
           onClose={() => setIsPoolModalOpen(false)}
           onSaveAndBroadcast={handleSaveAndBroadcastPool}
-        />
-      )}
-
-      {isSimulatorModalOpen && (
-        <SimulatorModal
-          workers={workers}
-          onClose={() => setIsSimulatorModalOpen(false)}
-          onSpawnWorker={handleSpawnSimulator}
-          onKillWorker={handleKillSimulator}
         />
       )}
 

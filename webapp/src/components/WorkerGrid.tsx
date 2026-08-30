@@ -1,13 +1,8 @@
 import React, { useState } from 'react';
 import { 
   Search, 
-  Filter, 
   Server, 
-  Grid, 
-  List, 
-  PlusCircle,
-  Activity,
-  Layers
+  Activity
 } from 'lucide-react';
 import { WorkerTelemetry } from '../types';
 import { WorkerCard } from './WorkerCard';
@@ -20,7 +15,6 @@ interface WorkerGridProps {
   onSetThreads: (id: string, threads: number) => void;
   onRename: (id: string, newName: string) => void;
   onOpenDetails: (worker: WorkerTelemetry) => void;
-  onOpenSimulator: () => void;
 }
 
 export const WorkerGrid: React.FC<WorkerGridProps> = ({
@@ -31,7 +25,6 @@ export const WorkerGrid: React.FC<WorkerGridProps> = ({
   onSetThreads,
   onRename,
   onOpenDetails,
-  onOpenSimulator,
 }) => {
   const [searchQuery, setSearchQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState<'ALL' | 'RUNNING' | 'STOPPED' | 'OFFLINE'>('ALL');
@@ -136,16 +129,9 @@ export const WorkerGrid: React.FC<WorkerGridProps> = ({
           <div>
             <h3 className="text-base font-bold text-white">No Connected S905X Workers Found</h3>
             <p className="text-xs text-zinc-400 mt-1 max-w-md mx-auto">
-              Start your worker daemons on your Amlogic S905X boxes or spin up simulated workers to test remote commanding.
+              Start your worker daemons on your Amlogic S905X boxes. Workers connect automatically when they authenticate with the controller.
             </p>
           </div>
-          <button
-            onClick={onOpenSimulator}
-            className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-orange-500 hover:bg-orange-600 text-zinc-950 text-xs font-bold transition shadow"
-          >
-            <PlusCircle className="w-4 h-4" />
-            Spawn Simulated S905X Node
-          </button>
         </div>
       )}
     </div>

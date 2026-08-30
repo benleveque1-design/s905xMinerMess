@@ -157,11 +157,7 @@ export const WorkerCard: React.FC<WorkerCardProps> = ({
             <div className="flex items-center gap-2 mt-1 text-xs text-zinc-400 font-mono">
               <span className="truncate">{worker.workerId}</span>
               {worker.ip && <span>• {worker.ip}</span>}
-              {worker.isSimulated && (
-                <span className="px-1.5 py-0.2 rounded text-[10px] bg-blue-950/80 text-blue-300 border border-blue-800/60 font-sans">
-                  SIM
-                </span>
-              )}
+
             </div>
           </div>
 

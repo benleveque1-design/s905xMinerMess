@@ -2214,7 +2214,7 @@ static void print_usage(const char *prog_name) {
 int main(int argc, char *argv[]) {
     int do_mine = 0;
     char pool_url[256] = "stratum+tcp://pool.basedmining.xyz:3335";
-    char pool_user[256] = "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh.s905x";
+    char pool_user[256] = "YOUR_BTC_ADDRESS.workername";
     char pool_pass[256] = "x";
     int do_test = 0;
     int do_benchmark = 0;

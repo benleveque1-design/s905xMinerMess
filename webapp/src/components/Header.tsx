@@ -9,10 +9,10 @@ import {
   CheckCircle2, 
   Layers, 
   Settings2, 
-  PlusCircle, 
   Download, 
   Activity,
-  Zap
+  Zap,
+  RefreshCw
 } from 'lucide-react';
 import { FleetStats, PoolConfig } from '../types';
 
@@ -24,8 +24,8 @@ interface HeaderProps {
   onStopAll: () => void;
   onRestartAll: () => void;
   onOpenPoolConfig: () => void;
-  onOpenSimulator: () => void;
   onOpenAgentSetup: () => void;
+  onRestartController: () => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -36,8 +36,8 @@ export const Header: React.FC<HeaderProps> = ({
   onStopAll,
   onRestartAll,
   onOpenPoolConfig,
-  onOpenSimulator,
   onOpenAgentSetup,
+  onRestartController,
 }) => {
   const getTempColor = (t: number) => {
     if (t <= 0) return 'text-zinc-400';
@@ -94,21 +94,22 @@ export const Header: React.FC<HeaderProps> = ({
           </button>
 
           <button
-            id="btn-add-sim"
-            onClick={onOpenSimulator}
-            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md bg-zinc-800 hover:bg-zinc-700 text-zinc-200 border border-zinc-700 transition"
-          >
-            <PlusCircle className="w-3.5 h-3.5 text-blue-400" />
-            Simulate S905X
-          </button>
-
-          <button
             id="btn-agent-setup"
             onClick={onOpenAgentSetup}
             className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md bg-zinc-800 hover:bg-zinc-700 text-zinc-200 border border-zinc-700 transition"
           >
             <Download className="w-3.5 h-3.5 text-emerald-400" />
             S905X Agent
+          </button>
+
+          <button
+            id="btn-restart-controller"
+            onClick={onRestartController}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md bg-amber-950/40 hover:bg-amber-900/60 text-amber-300 border border-amber-800/60 transition"
+            title="Restart the controller process (workers reconnect automatically)"
+          >
+            <RefreshCw className="w-3.5 h-3.5" />
+            Restart Controller
           </button>
         </div>
       </div>

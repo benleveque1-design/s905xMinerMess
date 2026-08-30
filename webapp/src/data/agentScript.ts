@@ -53,8 +53,8 @@ class S905XWorkerAgent:
         self.control_core = 3 if self.max_cores >= 4 else max(0, self.max_cores - 1)
         
         self.pool = {
-            "url": "stratum+tcp://solo.ckpool.org:3333",
-            "user": "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh.s905x",
+            "url": "stratum+tcp://pool.basedmining.xyz:3335",
+            "user": "YOUR_BTC_ADDRESS.workername",
             "pass": "x"
         }
         
@@ -179,8 +179,8 @@ class S905XWorkerAgent:
         
         # Check if live pool is configured
         if self.pool and self.pool.get("url"):
-            pool_url = self.pool.get("url", "stratum+tcp://solo.ckpool.org:3333")
-            pool_user = self.pool.get("user", "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh.s905x")
+            pool_url = self.pool.get("url", "stratum+tcp://pool.basedmining.xyz:3335")
+            pool_user = self.pool.get("user", "YOUR_BTC_ADDRESS.workername")
             pool_pass = self.pool.get("pass", "x")
             cmd.extend([
                 "--pool", pool_url,

@@ -59,7 +59,7 @@ class S905XWorkerAgent:
         self.pool_env_override = bool(env_pool_url)
         self.pool = {
             "url": env_pool_url or "stratum+tcp://pool.basedmining.xyz:3335",
-            "user": env_pool_user or "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh.s905x",
+            "user": env_pool_user or "YOUR_BTC_ADDRESS.workername",
             "pass": env_pool_pass or "x"
         }
         
@@ -194,7 +194,7 @@ class S905XWorkerAgent:
         # Check if live pool is configured
         if self.pool and self.pool.get("url"):
             pool_url = self.pool.get("url", "stratum+tcp://pool.basedmining.xyz:3335")
-            pool_user = self.pool.get("user", "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh.s905x")
+            pool_user = self.pool.get("user", "YOUR_BTC_ADDRESS.workername")
             pool_pass = self.pool.get("pass", "x")
             cmd.extend([
                 "--pool", pool_url,

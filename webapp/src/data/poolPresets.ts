@@ -15,12 +15,24 @@ export interface PoolPreset {
 
 export const POOL_PRESETS: PoolPreset[] = [
   {
+    id: 'basedmining',
+    name: 'Based Mining (Pooled)',
+    url: 'stratum+tcp://pool.basedmining.xyz:3335',
+    defaultPort: 3335,
+    userFormat: '<YOUR_BITCOIN_ADDRESS>[.workername]',
+    userPlaceholder: 'bc1q...youraddress.s905x',
+    defaultPass: 'x',
+    isSolo: false,
+    description:
+      'Community mining pool. Payouts sent directly to the Bitcoin address in the username field. No account registration required.',
+  },
+  {
     id: 'solo-ckpool',
     name: 'Solo CKPool (Solo Mining)',
     url: 'stratum+tcp://solo.ckpool.org:3333',
     defaultPort: 3333,
     userFormat: '<YOUR_BITCOIN_ADDRESS>[.workername]',
-    userPlaceholder: 'bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh.s905x_1',
+    userPlaceholder: 'bc1q...youraddress.s905x_1',
     defaultPass: 'x',
     isSolo: true,
     description:
@@ -77,9 +89,9 @@ export const POOL_PRESETS: PoolPreset[] = [
 ];
 
 export const DEFAULT_POOL: PoolConfig = {
-  url: 'stratum+tcp://solo.ckpool.org:3333',
-  user: 'bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh.s905x',
+  url: 'stratum+tcp://pool.basedmining.xyz:3335',
+  user: 'YOUR_BTC_ADDRESS.workername',
   pass: 'x',
-  name: 'Solo CKPool',
-  isSolo: true,
+  name: 'Based Mining',
+  isSolo: false,
 };

@@ -59,11 +59,7 @@ export const WorkerDetailsModal: React.FC<WorkerDetailsModalProps> = ({
                 <span className="text-xs font-mono px-2 py-0.5 rounded bg-zinc-800 text-zinc-300 border border-zinc-700">
                   {worker.workerId}
                 </span>
-                {worker.isSimulated && (
-                  <span className="text-[10px] font-sans px-1.5 py-0.5 rounded bg-blue-950 text-blue-300 border border-blue-800">
-                    SIMULATED
-                  </span>
-                )}
+
               </div>
               <p className="text-xs text-zinc-400 mt-0.5">
                 IP: {worker.ip || '127.0.0.1'} • Status: <span className="text-emerald-400 font-semibold">{worker.state}</span> • {worker.threads} Threads @ {worker.cpuFreqMhz} MHz

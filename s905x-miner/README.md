@@ -69,7 +69,7 @@ You can point the C binary directly to any Stratum V1 Bitcoin pool:
 ```bash
 ./bitcoin_sha256d_s905x --mine \
   -P stratum+tcp://solo.ckpool.org:3333 \
-  -u bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh.s905x-box \
+  -u YOUR_BTC_ADDRESS.s905x-box \
   -p x \
   -j 3 \
   -c 3

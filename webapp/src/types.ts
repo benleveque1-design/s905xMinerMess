@@ -23,7 +23,6 @@ export interface WorkerTelemetry {
   sharesRejected: number;
   uptime: number; // in seconds
   lastSeen: number; // timestamp ms
-  isSimulated?: boolean;
   pool: PoolConfig;
   arch?: string;
   hwCrypto?: boolean;

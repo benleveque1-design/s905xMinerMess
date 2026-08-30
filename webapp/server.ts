@@ -2,6 +2,7 @@ import "dotenv/config";
 import express from "express";
 import http from "http";
 import path from "path";
+import fs from "fs";
 import crypto from "crypto";
 import { WebSocketServer, WebSocket } from "ws";
 import { createServer as createViteServer } from "vite";
@@ -23,6 +24,72 @@ function tokenMatches(candidate: unknown): boolean {
   return crypto.timingSafeEqual(a, b);
 }
 
+// ---------------------------------------------------------------------------
+// Persistent configuration — pool settings and BTC address survive restarts
+// ---------------------------------------------------------------------------
+const CONFIG_PATH = path.join(process.cwd(), "controller-config.json");
+
+interface PersistentConfig {
+  pool: {
+    url: string;
+    user: string;
+    pass: string;
+    name: string;
+    isSolo: boolean;
+  };
+  btcAddress: string;
+}
+
+const DEFAULT_BTC_ADDRESS = "YOUR_BTC_ADDRESS";
+
+const DEFAULT_CONFIG: PersistentConfig = {
+  pool: {
+    url: "stratum+tcp://pool.basedmining.xyz:3335",
+    user: `${DEFAULT_BTC_ADDRESS}.s905x`,
+    pass: "x",
+    name: "Based Mining",
+    isSolo: false,
+  },
+  btcAddress: DEFAULT_BTC_ADDRESS,
+};
+
+function loadConfig(): PersistentConfig {
+  try {
+    if (fs.existsSync(CONFIG_PATH)) {
+      const raw = fs.readFileSync(CONFIG_PATH, "utf-8");
+      const parsed = JSON.parse(raw);
+      // Merge with defaults so new fields are always present
+      return { ...DEFAULT_CONFIG, ...parsed, pool: { ...DEFAULT_CONFIG.pool, ...parsed.pool } };
+    }
+  } catch (err) {
+    console.warn("[S905X Controller] Failed to load persistent config, using defaults:", err);
+  }
+  return { ...DEFAULT_CONFIG };
+}
+
+function saveConfig(config: PersistentConfig): void {
+  try {
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2) + "\n", "utf-8");
+    console.log(`[S905X Controller] Config saved to ${CONFIG_PATH}`);
+  } catch (err) {
+    console.error("[S905X Controller] Failed to save config:", err);
+  }
+}
+
+let persistentConfig = loadConfig();
+
+// Override BTC address from env if set
+if (process.env.POOL_USER) {
+  persistentConfig.pool.user = process.env.POOL_USER;
+  const addr = process.env.POOL_USER.split(".")[0];
+  if (addr) persistentConfig.btcAddress = addr;
+}
+if (process.env.POOL_URL) {
+  persistentConfig.pool.url = process.env.POOL_URL;
+  persistentConfig.pool.isSolo = false;
+  persistentConfig.pool.name = "Custom Pool";
+}
+
 interface WorkerRecord {
   workerId: string;
   name: string;
@@ -38,7 +105,6 @@ interface WorkerRecord {
   sharesRejected: number;
   uptime: number;
   lastSeen: number;
-  isSimulated?: boolean;
   arch?: string;
   hwCrypto?: boolean;
   pool: {
@@ -56,14 +122,7 @@ const workers = new Map<string, WorkerRecord>();
 const workerSockets = new Map<string, WebSocket>();
 const clientSockets = new Set<WebSocket>();
 
-const envPoolUrl = process.env.POOL_URL;
-let globalPool = {
-  url: envPoolUrl ?? "stratum+tcp://solo.ckpool.org:3333",
-  user: process.env.POOL_USER ?? "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh.s905x",
-  pass: process.env.POOL_PASS ?? "x",
-  name: envPoolUrl ? "Based Mining" : "Solo CKPool",
-  isSolo: !envPoolUrl,
-};
+let globalPool = { ...persistentConfig.pool };
 
 // Broadcast message to all connected Web Dashboard clients
 function broadcastToClients(msg: any) {
@@ -85,11 +144,7 @@ function sendWorkerCommand(workerId: string, command: any): boolean {
         sentCount++;
       }
     }
-    // Also apply to simulated workers if active
-    for (const sim of simulatedWorkers.values()) {
-      sim.handleCommand({ ...command, workerId: sim.id });
-    }
-    return sentCount > 0 || simulatedWorkers.size > 0;
+    return sentCount > 0;
   }
 
   const ws = workerSockets.get(workerId);
@@ -98,211 +153,7 @@ function sendWorkerCommand(workerId: string, command: any): boolean {
     return true;
   }
 
-  const sim = simulatedWorkers.get(workerId);
-  if (sim) {
-    sim.handleCommand(command);
-    return true;
-  }
-
   return false;
-}
-
-// Simulated Worker Class for zero-setup realistic testing
-class SimulatedWorker {
-  id: string;
-  name: string;
-  threads: number = 4;
-  state: 'RUNNING' | 'STOPPED' | 'ERROR' | 'RESTARTING' = 'RUNNING';
-  temp: number = 54.0;
-  targetTemp: number = 62.0;
-  freq: number = 1512;
-  sharesFound: number = 0;
-  sharesAccepted: number = 0;
-  sharesRejected: number = 0;
-  uptime: number = 0;
-  timer: NodeJS.Timeout | null = null;
-  baseHashratePerThread: number = 1.05; // 4.2 MH/s on 4 cores Cortex-A53 HW crypto
-
-  constructor(id: string, name: string) {
-    this.id = id;
-    this.name = name;
-    this.startLoop();
-  }
-
-  startLoop() {
-    this.timer = setInterval(() => {
-      this.uptime += 2;
-      
-      // Calculate realistic thermal and frequency dynamics
-      if (this.state === 'RUNNING') {
-        this.targetTemp = 52.0 + this.threads * 3.2 + (Math.random() * 1.5 - 0.75);
-        this.temp += (this.targetTemp - this.temp) * 0.15;
-        this.freq = this.temp > 78 ? 1200 : 1512; // Thermal throttle simulation
-        
-        // Hashrate calculation with slight jitter
-        const jitter = (Math.random() * 0.08 - 0.04);
-        const hashrate = Number((this.threads * this.baseHashratePerThread * (this.freq / 1512) + jitter).toFixed(2));
-        
-        // Share generation (~1 share every ~20-30 seconds per worker)
-        if (Math.random() < 0.12) {
-          this.sharesFound++;
-          if (Math.random() < 0.98) {
-            this.sharesAccepted++;
-            this.log('SUCCESS', `Found share target matching difficulty! [Accepted]`);
-          } else {
-            this.sharesRejected++;
-            this.log('WARN', `Share rejected by pool (stale job)`);
-          }
-        }
-
-        this.updateTelemetry(hashrate);
-      } else {
-        // Cooling down
-        this.temp += (42.0 - this.temp) * 0.1;
-        this.updateTelemetry(0.0);
-      }
-    }, 2000);
-  }
-
-  updateTelemetry(hashrate: number) {
-    const existing = workers.get(this.id);
-    const now = Date.now();
-    
-    const hHist = existing ? [...existing.hashrateHistory] : [];
-    hHist.push({ time: now, hashrate });
-    if (hHist.length > 30) hHist.shift();
-
-    const tHist = existing ? [...existing.tempHistory] : [];
-    tHist.push({ time: now, temp: Number(this.temp.toFixed(1)) });
-    if (tHist.length > 30) tHist.shift();
-
-    const telemetry: WorkerRecord = {
-      workerId: this.id,
-      name: this.name,
-      ip: "192.168.1.1" + (Math.abs(hashCode(this.id)) % 80 + 10),
-      state: this.state,
-      threads: this.threads,
-      maxCores: 4,
-      hashrateMhs: hashrate,
-      tempC: Number(this.temp.toFixed(1)),
-      cpuFreqMhz: this.freq,
-      sharesFound: this.sharesFound,
-      sharesAccepted: this.sharesAccepted,
-      sharesRejected: this.sharesRejected,
-      uptime: this.uptime,
-      lastSeen: now,
-      isSimulated: true,
-      arch: "aarch64 Cortex-A53 (Simulated)",
-      hwCrypto: true,
-      pool: { ...globalPool },
-      hashrateHistory: hHist,
-      tempHistory: tHist,
-      recentLogs: existing?.recentLogs || [],
-    };
-
-    workers.set(this.id, telemetry);
-    broadcastToClients({ type: "worker_update", worker: telemetry });
-  }
-
-  log(level: string, message: string) {
-    const entry = {
-      id: Math.random().toString(36).substring(2, 9),
-      workerId: this.id,
-      timestamp: Date.now(),
-      level,
-      message,
-    };
-    const existing = workers.get(this.id);
-    if (existing) {
-      existing.recentLogs.unshift(entry);
-      if (existing.recentLogs.length > 50) existing.recentLogs.pop();
-    }
-    broadcastToClients({ type: "log", log: entry });
-  }
-
-  handleCommand(cmd: any) {
-    const { action, params = {}, cmdId } = cmd;
-    let message = "";
-    
-    if (action === "start") {
-      this.state = "RUNNING";
-      message = `Simulated worker ${this.name} started (${this.threads} threads)`;
-      this.log('INFO', message);
-    } else if (action === "stop") {
-      this.state = "STOPPED";
-      message = `Simulated worker ${this.name} stopped`;
-      this.log('INFO', message);
-    } else if (action === "restart") {
-      this.state = "RESTARTING";
-      this.log('INFO', `Restarting miner process...`);
-      setTimeout(() => {
-        this.state = "RUNNING";
-        this.log('INFO', `Miner restarted successfully with ${this.threads} threads`);
-      }, 800);
-      message = `Miner restarted`;
-    } else if (action === "set_threads") {
-      this.threads = Math.max(1, Math.min(4, Number(params.threads || 4)));
-      message = `Configured ${this.threads} threads on ${this.name}`;
-      this.log('INFO', message);
-    } else if (action === "set_pool") {
-      if (params.pool) {
-        globalPool = { ...globalPool, ...params.pool };
-      }
-      message = `Pool updated to ${params.pool?.url || globalPool.url}`;
-      this.log('INFO', message);
-    } else if (action === "rename") {
-      this.name = params.name || this.name;
-      message = `Worker renamed to ${this.name}`;
-    }
-
-    broadcastToClients({
-      type: "command_ack",
-      ack: {
-        cmdId: cmdId || "cmd-" + Date.now(),
-        workerId: this.id,
-        status: "ok",
-        message,
-        timestamp: Date.now(),
-      },
-    });
-  }
-
-  destroy() {
-    if (this.timer) clearInterval(this.timer);
-    workers.delete(this.id);
-    broadcastToClients({ type: "worker_offline", workerId: this.id });
-  }
-}
-
-function hashCode(str: string) {
-  let hash = 0;
-  for (let i = 0; i < str.length; i++) {
-    hash = (hash << 5) - hash + str.charCodeAt(i);
-    hash |= 0;
-  }
-  return hash;
-}
-
-const simulatedWorkers = new Map<string, SimulatedWorker>();
-
-// Initialize with 3 simulated S905X nodes out of the box for immediate previewing
-function initDefaultSimulators() {
-  simulatedWorkers.set("s905x-node-01", new SimulatedWorker("s905x-node-01", "S905X Rack Unit 1 (Living Room)"));
-  simulatedWorkers.set("s905x-node-02", new SimulatedWorker("s905x-node-02", "S905X Rack Unit 2 (Lab Bench)"));
-  simulatedWorkers.set("s905x-node-03", new SimulatedWorker("s905x-node-03", "S905X Rack Unit 3 (Cluster Node)"));
-}
-
-// When the first real S905X agent authenticates, retire the demo fleet so the
-// dashboard reflects physical hardware instead of fabricated telemetry.
-let realHardwareSeen = false;
-function destroySimulatedFleet(reason: string) {
-  for (const [id, sim] of simulatedWorkers.entries()) {
-    sim.destroy();
-    simulatedWorkers.delete(id);
-  }
-  if (simulatedWorkers.size === 0) {
-    console.log(`[S905X Controller] Simulated fleet removed: ${reason}`);
-  }
 }
 
 async function startServer() {
@@ -321,14 +172,11 @@ async function startServer() {
   const server = http.createServer(app);
   const wss = new WebSocketServer({ server });
 
-  // Initialize initial simulated workers
-  initDefaultSimulators();
-
   // Watchdog timer: check every 2.5 seconds for dead real workers (> 8 seconds silent)
   setInterval(() => {
     const now = Date.now();
     for (const [id, worker] of workers.entries()) {
-      if (!worker.isSimulated && worker.state !== 'OFFLINE' && now - worker.lastSeen > 8000) {
+      if (worker.state !== 'OFFLINE' && now - worker.lastSeen > 8000) {
         worker.state = 'OFFLINE';
         worker.hashrateMhs = 0.0;
         broadcastToClients({ type: "worker_offline", workerId: id });
@@ -362,6 +210,8 @@ async function startServer() {
             // dashboard WebSocket (same semantics as POST /api/pool).
             if (data.action === "set_pool" && data.params?.pool) {
               globalPool = { ...globalPool, ...data.params.pool };
+              persistentConfig.pool = { ...globalPool };
+              saveConfig(persistentConfig);
               broadcastToClients({ type: "pool_update", pool: globalPool });
             }
             const success = sendWorkerCommand(data.workerId, data);
@@ -404,12 +254,6 @@ async function startServer() {
             authenticatedWorkerId = data.workerId;
             workerSockets.set(authenticatedWorkerId, ws);
 
-            if (!realHardwareSeen) {
-              realHardwareSeen = true;
-              destroySimulatedFleet(`real worker '${authenticatedWorkerId}' connected`);
-              broadcastToClients({ type: "fleet_sync", workers: Array.from(workers.values()), poolConfig: globalPool });
-            }
-
             const now = Date.now();
             const existing = workers.get(authenticatedWorkerId);
 
@@ -428,7 +272,6 @@ async function startServer() {
               sharesRejected: 0,
               uptime: 0,
               lastSeen: now,
-              isSimulated: false,
               arch: data.arch || "aarch64 Cortex-A53",
               hwCrypto: data.hwCrypto ?? true,
               pool: globalPool,
@@ -522,7 +365,7 @@ async function startServer() {
     res.json({
       status: "ok",
       server: "S905X Mining Controller",
-      connectedWorkers: workerSockets.size + simulatedWorkers.size,
+      connectedWorkers: workerSockets.size,
       connectedDashboards: clientSockets.size,
       timestamp: Date.now(),
     });
@@ -552,6 +395,9 @@ async function startServer() {
 
   app.post("/api/pool", requireApiAuth, (req, res) => {
     globalPool = { ...globalPool, ...req.body };
+    // Persist pool config
+    persistentConfig.pool = { ...globalPool };
+    saveConfig(persistentConfig);
     // Broadcast to all workers
     sendWorkerCommand("all", {
       type: "command",
@@ -563,26 +409,25 @@ async function startServer() {
     res.json({ success: true, pool: globalPool });
   });
 
-  // Simulator Endpoints
-  app.post("/api/simulator/spawn", requireApiAuth, (req, res) => {
-    const count = simulatedWorkers.size + 1;
-    const id = `s905x-sim-${count}`;
-    const name = req.body.name || `S905X Node 0${count}`;
-    const sim = new SimulatedWorker(id, name);
-    simulatedWorkers.set(id, sim);
-    res.json({ success: true, workerId: id, name });
+  // Persistent config endpoints (BTC address, etc.)
+  app.get("/api/config", (req, res) => {
+    res.json({ btcAddress: persistentConfig.btcAddress });
   });
 
-  app.post("/api/simulator/kill", requireApiAuth, (req, res) => {
-    const id = req.body.workerId;
-    const sim = simulatedWorkers.get(id);
-    if (sim) {
-      sim.destroy();
-      simulatedWorkers.delete(id);
-      res.json({ success: true, workerId: id });
-    } else {
-      res.status(404).json({ error: "Simulated worker not found" });
+  app.post("/api/config", requireApiAuth, (req, res) => {
+    if (req.body.btcAddress) {
+      persistentConfig.btcAddress = req.body.btcAddress;
+      saveConfig(persistentConfig);
     }
+    res.json({ success: true, btcAddress: persistentConfig.btcAddress });
+  });
+
+  // Safe controller restart — clean exit triggers systemd Restart=always
+  app.post("/api/restart", requireApiAuth, (req, res) => {
+    res.json({ success: true, message: "Controller restarting..." });
+    console.log("[S905X Controller] Restart requested via API — exiting cleanly");
+    // Give the response a moment to reach the client before exiting
+    setTimeout(() => process.exit(0), 500);
   });
 
   // Vite middleware for development & SPA static hosting for production
@@ -604,6 +449,7 @@ async function startServer() {
     console.log(`[S905X Controller] Server listening on http://0.0.0.0:${PORT}`);
     console.log(`[S905X Controller] Worker WS Endpoint: ws://<HOST>:${PORT}/ws/worker`);
     console.log(`[S905X Controller] Dashboard WS Endpoint: ws://<HOST>:${PORT}/ws/client`);
+    console.log(`[S905X Controller] Pool: ${globalPool.url} | BTC: ${persistentConfig.btcAddress}`);
   });
 }
 
